@@ -43,14 +43,7 @@ executorEnv.__CHESS_BOOT_GUARD = {
     JobId = tostring(game.JobId),
 }
 
--- After a teleport, MatchClient expects VersusScreen to already exist.
-local VersusScreen
-repeat
-    VersusScreen = PlayerGui:FindFirstChild("VersusScreen")
-    if not VersusScreen then
-        task.wait(0.5)
-    end
-until VersusScreen
+
 
 -- Retry module loading instead of allowing one startup race to kill the
 -- entire bot. This is especially important after Roblox teleports.
