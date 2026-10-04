@@ -32,8 +32,10 @@ local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("C
 local CHESS_API_URL = "https://chess-api.com/v1"
 local CHESS_API_DEPTH = 18
 local CHESS_API_MAX_THINKING_MS = 100
-local API_REQUEST_GAP = 0.75
-local API_FAILURE_BACKOFF = 2.0
+local API_REQUEST_GAP = 1.0
+local API_FAILURE_BACKOFF = 3.0
+local API_MAX_REQUESTS_PER_MINUTE = 18
+local API_HIGH_USAGE_COOLDOWN = 60
 local CONFIG_FILE = "prometheus_stockfish_config.json"
 local SERVER_LIST_LIMIT = 50
 local SERVER_SCAN_PAGES = 5
@@ -233,6 +235,18 @@ local state = {
     LastMoveUci = nil,
     LastEngineFen = nil,
     LastEngineResult = nil,
+
+    -- Accuracy uses the engine result from the position BEFORE a move and
+    -- one analysis of the position AFTER that move. This avoids the old
+    -- searchmoves double-request method and keeps the result legal for both
+    -- White and Black.
+    AccuracyBaselineFen = nil,
+    AccuracyBaselineResult = nil,
+
+    -- Public API protection. These are runtime-only and never saved to the
+    -- user's config, so Auto Ranked ON/OFF is unaffected.
+    ApiHighUsageUntil = 0,
+    ApiRequestTimes = {},
 
     -- Ranked-cycle runtime guards. These do not alter the saved AutoRanked
     -- setting; only the user's toggle/config does that.
@@ -500,13 +514,47 @@ end
 local apiRequestBusy = false
 local apiNextRequestAt = 0
 
+local function pruneApiRequestTimes(now)
+    now = now or os.clock()
+    local cutoff = now - 60
+    local times = state.ApiRequestTimes
+    local first = 1
+
+    while times[first] and times[first] < cutoff do
+        first = first + 1
+    end
+
+    if first > 1 then
+        local kept = {}
+        for i = first, #times do
+            kept[#kept + 1] = times[i]
+        end
+        state.ApiRequestTimes = kept
+        times = kept
+    end
+
+    return times
+end
+
+local function isHighUsageText(value)
+    return type(value) == "string"
+        and string.find(string.upper(value), "HIGH_USAGE", 1, true) ~= nil
+end
+
 local function requestStockfish(payload)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
     end
 
-    -- All engine/accuracy calls share one request lane. This prevents
-    -- concurrent requests from overwhelming the public API.
+    local requestKind = payload.kind == "accuracy" and "accuracy" or "engine"
+
+    if requestKind == "accuracy" and os.clock() < state.ApiHighUsageUntil then
+        error("ACCURACY_COOLDOWN")
+    end
+
+    -- One serialized lane for the whole API. Accuracy requests also have a
+    -- rolling-minute budget and yield first; engine requests remain the
+    -- priority needed to play the game.
     while apiRequestBusy do
         if state.Destroyed then
             error("Script destroyed while waiting for API request")
@@ -522,6 +570,20 @@ local function requestStockfish(payload)
             task.wait(waitTime)
         end
 
+        while true do
+            local now = os.clock()
+            local times = pruneApiRequestTimes(now)
+
+            if #times < API_MAX_REQUESTS_PER_MINUTE or requestKind == "engine" then
+                break
+            end
+
+            -- Never delay engine move generation for an optional accuracy
+            -- request. Simply skip the accuracy calculation once the local
+            -- budget is full; the move itself can still be played normally.
+            error("ACCURACY_LOCAL_RATE_LIMIT")
+        end
+
         local apiPayload = {
             fen = payload.fen,
             depth = CHESS_API_DEPTH,
@@ -532,6 +594,8 @@ local function requestStockfish(payload)
         if type(payload.searchmoves) == "string" and payload.searchmoves ~= "" then
             apiPayload.searchmoves = payload.searchmoves
         end
+
+        table.insert(state.ApiRequestTimes, os.clock())
 
         local response = requestFunction({
             Url = CHESS_API_URL,
@@ -547,6 +611,13 @@ local function requestStockfish(payload)
         end
 
         local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
+        local responseBody = response.Body or response.body or ""
+
+        if statusCode == 429 or isHighUsageText(responseBody) then
+            state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+            error("HIGH_USAGE")
+        end
+
         if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
             error(
                 "Chess API HTTP " .. tostring(statusCode) .. " "
@@ -554,18 +625,21 @@ local function requestStockfish(payload)
             )
         end
 
-        local body = response.Body or response.body
-        if type(body) ~= "string" then
+        if type(responseBody) ~= "string" then
             error("Chess API returned no body")
         end
 
-        local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+        local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, responseBody)
         if not decodeOk or type(decoded) ~= "table" then
-            error("Invalid JSON from chess-api.com: " .. body)
+            error("Invalid JSON from chess-api.com: " .. responseBody)
         end
 
         if decoded.error then
             local apiError = tostring(decoded.error)
+            if isHighUsageText(apiError) then
+                state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+                error("HIGH_USAGE")
+            end
             if string.find(apiError, "FEN", 1, true) then
                 error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
             end
@@ -574,6 +648,10 @@ local function requestStockfish(payload)
 
         if decoded.type == "error" then
             local apiError = tostring(decoded.text or decoded.error or "unknown error")
+            if isHighUsageText(apiError) then
+                state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+                error("HIGH_USAGE")
+            end
             if string.find(apiError, "FEN", 1, true) or string.find(apiError, "FEN_VALIDATION", 1, true) then
                 error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
             end
@@ -584,9 +662,16 @@ local function requestStockfish(payload)
         return decoded
     end, debug.traceback)
 
-    -- Even failed requests get a cooldown so an outage/rate-limit cannot
-    -- turn the main loop into a rapid retry storm.
+    -- Even failed requests get a cooldown. HIGH_USAGE is additionally turned
+    -- into a longer circuit breaker for accuracy requests.
     if not ok then
+        local message = tostring(result)
+        if isHighUsageText(message) then
+            state.ApiHighUsageUntil = math.max(
+                state.ApiHighUsageUntil,
+                os.clock() + API_HIGH_USAGE_COOLDOWN
+            )
+        end
         apiNextRequestAt = os.clock() + API_FAILURE_BACKOFF
     else
         apiNextRequestAt = math.max(apiNextRequestAt, os.clock() + API_REQUEST_GAP)
@@ -1066,22 +1151,30 @@ local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromO
 local function makeAccuracyBox(position, titleText)
     makeLabel(main, position, UDim2.fromOffset(130, 16), titleText, 9, Color3.fromRGB(130, 138, 155))
 
-    local box = Instance.new("TextBox")
+    local box = Instance.new("ScrollingFrame")
     box.Size = UDim2.fromOffset(350, 58)
     box.Position = UDim2.fromOffset(16, position.Y.Offset + 16)
     box.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
     box.BorderSizePixel = 0
-    box.ClearTextOnFocus = false
-    box.MultiLine = true
-    box.TextEditable = false
-    box.Font = Enum.Font.GothamMedium
-    box.TextSize = 9
-    box.TextColor3 = Color3.fromRGB(210, 215, 225)
-    box.TextXAlignment = Enum.TextXAlignment.Left
-    box.TextYAlignment = Enum.TextYAlignment.Top
-    box.TextWrapped = false
-    box.Text = "No moves analyzed yet."
+    box.CanvasSize = UDim2.fromOffset(0, 0)
+    box.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    box.ScrollingDirection = Enum.ScrollingDirection.Y
+    box.ScrollBarThickness = 4
+    box.ScrollBarImageTransparency = 0.35
+    box.ClipsDescendants = true
     box.Parent = main
+
+    local padding = Instance.new("UIPadding")
+    padding.PaddingLeft = UDim.new(0, 7)
+    padding.PaddingRight = UDim.new(0, 7)
+    padding.PaddingTop = UDim.new(0, 5)
+    padding.PaddingBottom = UDim.new(0, 5)
+    padding.Parent = box
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 1)
+    layout.Parent = box
 
     local boxCorner = Instance.new("UICorner")
     boxCorner.CornerRadius = UDim.new(0, 7)
@@ -1257,6 +1350,11 @@ local function analyzeCurrent(board)
     state.LastEngineFen = positionFen
     state.LastEngineResult = result
 
+    if state.AccuracyBaselineFen == nil then
+        state.AccuracyBaselineFen = positionFen
+        state.AccuracyBaselineResult = result
+    end
+
     state.Recommendation = result
     updateAnalysisUI(result)
     return result
@@ -1300,13 +1398,37 @@ local function playRecommendation(recommendation)
     return ok
 end
 
+local function refreshAccuracyBox(box, lines)
+    for _, child in ipairs(box:GetChildren()) do
+        if child:IsA("TextLabel") then
+            child:Destroy()
+        end
+    end
+
+    for index, line in ipairs(lines) do
+        local label = Instance.new("TextLabel")
+        label.BackgroundTransparency = 1
+        label.Size = UDim2.new(1, -2, 0, 15)
+        label.Font = Enum.Font.GothamMedium
+        label.TextSize = 9
+        label.TextColor3 = Color3.fromRGB(210, 215, 225)
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.TextYAlignment = Enum.TextYAlignment.Center
+        label.TextWrapped = false
+        label.Text = line
+        label.LayoutOrder = index
+        label.Parent = box
+    end
+
+    task.defer(function()
+        local bottom = math.max(0, box.AbsoluteCanvasSize.Y - box.AbsoluteWindowSize.Y)
+        box.CanvasPosition = Vector2.new(0, bottom)
+    end)
+end
+
 local function setAccuracyBoxes()
-    whiteAccuracyBox.Text = (#state.WhiteAccuracyMoves > 0)
-        and table.concat(state.WhiteAccuracyMoves, "\n")
-        or "No moves analyzed yet."
-    blackAccuracyBox.Text = (#state.BlackAccuracyMoves > 0)
-        and table.concat(state.BlackAccuracyMoves, "\n")
-        or "No moves analyzed yet."
+    refreshAccuracyBox(whiteAccuracyBox, state.WhiteAccuracyMoves)
+    refreshAccuracyBox(blackAccuracyBox, state.BlackAccuracyMoves)
 end
 
 local function appendAccuracyMove(job, accuracy, classification, cpl)
@@ -1322,101 +1444,98 @@ local function appendAccuracyMove(job, accuracy, classification, cpl)
 
     local target = job.side == "White" and state.WhiteAccuracyMoves or state.BlackAccuracyMoves
     table.insert(target, line)
-    while #target > 30 do
+    while #target > 40 do
         table.remove(target, 1)
     end
     setAccuracyBoxes()
 end
 
-local function showAccuracyUnavailable(job)
-    local moveNumber = tonumber(job.moveNumber) or 1
-    local line = string.format(
-        "%d. %s  •  Accuracy unavailable",
-        moveNumber,
-        job.playedMove
-    )
-
-    local target = job.side == "White" and state.WhiteAccuracyMoves or state.BlackAccuracyMoves
-    table.insert(target, line)
-    while #target > 30 do
-        table.remove(target, 1)
-    end
-    setAccuracyBoxes()
-end
-
-local function processAccuracyJob(job)
+local function processAccuracyJob(job, suppliedPostResult)
     if not job or state.Destroyed then
-        return
+        return false
     end
 
     if job.generation ~= state.AccuracyGeneration then
-        return
+        return false
     end
 
-    local bestResult
-
-    -- For our own move, analyzeCurrent() has already analyzed the exact
-    -- pre-move position, so reuse that unrestricted engine result.
-    if job.fen == state.LastEngineFen and type(state.LastEngineResult) == "table" then
-        bestResult = state.LastEngineResult
+    -- Never hammer the service after it has indicated HIGH_USAGE. Accuracy is
+    -- optional; engine move generation always remains the priority.
+    if os.clock() < state.ApiHighUsageUntil then
+        return false
     end
 
-    local bestOk = true
+    local bestResult = job.preResult
+    if not bestResult
+        and job.preFen == state.AccuracyBaselineFen
+        and type(state.AccuracyBaselineResult) == "table" then
+        bestResult = state.AccuracyBaselineResult
+    end
+
+    -- A missing baseline should be rare. Recover with one normal analysis,
+    -- but only when the local/API usage guard allows it.
     if not bestResult then
-        bestOk, bestResult = pcall(function()
+        local ok, result = pcall(function()
             return requestStockfish({
-                fen = job.fen,
+                fen = job.preFen,
+                kind = "accuracy",
             })
         end)
+        if not ok or not result then
+            return false
+        end
+        bestResult = result
     end
 
-    if not bestOk or not bestResult then
-        showAccuracyUnavailable(job)
-        return
+    local postResult = suppliedPostResult
+    if not postResult
+        and job.postFen == state.LastEngineFen
+        and type(state.LastEngineResult) == "table" then
+        postResult = state.LastEngineResult
     end
 
-    -- searchmoves forces Stockfish to evaluate ONLY the played move. Its
-    -- returned move is therefore not a valid test for whether the move was
-    -- optimal. Compare the unrestricted and restricted evaluations instead.
-    local playedOk, playedResult = pcall(function()
-        return requestStockfish({
-            fen = job.fen,
-            searchmoves = job.uci,
-        })
-    end)
-
-    if not playedOk or not playedResult then
-        showAccuracyUnavailable(job)
-        return
+    -- Normally the resulting position was already analyzed either by
+    -- ensureAccuracyBaseline() or analyzeCurrent(). Only request it here when
+    -- neither cache contains the exact post-move FEN.
+    if not postResult then
+        local ok, result = pcall(function()
+            return requestStockfish({
+                fen = job.postFen,
+                kind = "accuracy",
+            })
+        end)
+        if not ok or not result then
+            return false
+        end
+        postResult = result
     end
 
     local bestCp = apiResultToCp(bestResult)
-    local playedCp = apiResultToCp(playedResult)
+    local playedCp = apiResultToCp(postResult)
     if bestCp == nil or playedCp == nil then
-        showAccuracyUnavailable(job)
-        return
+        return false
     end
 
     local cpl
     if job.side == "White" then
-        -- chess-api.com reports centipawns from White's perspective.
         cpl = math.max(0, bestCp - playedCp)
     else
-        -- Black wants the evaluation to move lower.
         cpl = math.max(0, playedCp - bestCp)
     end
 
     local accuracy = accuracyFromCpl(cpl)
     if accuracy == nil then
-        showAccuracyUnavailable(job)
-        return
+        return false
     end
+
+    state.AccuracyBaselineFen = job.postFen
+    state.AccuracyBaselineResult = postResult
 
     state.AccuracySum = state.AccuracySum + accuracy
     state.AccuracyCount = state.AccuracyCount + 1
 
     if job.generation ~= state.AccuracyGeneration then
-        return
+        return false
     end
 
     local gameAccuracy = state.AccuracySum / state.AccuracyCount
@@ -1428,6 +1547,43 @@ local function processAccuracyJob(job)
         gameAccuracy,
         state.AccuracyCount
     )
+
+    return true
+end
+
+local function ensureAccuracyBaseline(board, snapshot)
+    if not board or not snapshot or state.Destroyed then
+        return
+    end
+
+    if snapshot.fen == state.AccuracyBaselineFen and type(state.AccuracyBaselineResult) == "table" then
+        return
+    end
+
+    if snapshot.fen == state.LastEngineFen and type(state.LastEngineResult) == "table" then
+        state.AccuracyBaselineFen = snapshot.fen
+        state.AccuracyBaselineResult = state.LastEngineResult
+        return
+    end
+
+    -- On the player's turn analyzeCurrent() will establish the baseline.
+    -- When it is the opponent's turn, we need one initial position analysis
+    -- so the first opponent move can also be scored correctly.
+    if isPlayerTurn(board) or os.clock() < state.ApiHighUsageUntil then
+        return
+    end
+
+    local ok, result = pcall(function()
+        return requestStockfish({
+            fen = snapshot.fen,
+            kind = "accuracy",
+        })
+    end)
+
+    if ok and result then
+        state.AccuracyBaselineFen = snapshot.fen
+        state.AccuracyBaselineResult = result
+    end
 end
 
 local function getMatchfinding()
@@ -1717,6 +1873,8 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.LastMoveUci = nil
         state.LastEngineFen = nil
         state.LastEngineResult = nil
+        state.AccuracyBaselineFen = nil
+        state.AccuracyBaselineResult = nil
         state.AccuracyMoveSerial = 0
         state.AccuracySum = 0
         state.AccuracyCount = 0
@@ -1805,6 +1963,8 @@ task.spawn(function()
             state.LastMoveUci = nil
             state.LastEngineFen = nil
             state.LastEngineResult = nil
+            state.AccuracyBaselineFen = nil
+            state.AccuracyBaselineResult = nil
             state.WhiteAccuracyMoves = {}
             state.BlackAccuracyMoves = {}
             setAccuracyBoxes()
@@ -1824,6 +1984,13 @@ task.spawn(function()
             state.AutoRankedBusy = false
         end
 
+        -- Establish the engine value of the current position when needed.
+        -- This is especially important when the user starts as Black, because
+        -- White can make the first move before analyzeCurrent() would run.
+        if currentMatch and snapshot then
+            ensureAccuracyBaseline(currentMatch, snapshot)
+        end
+
         -- Detect the move BEFORE replacing LastSnapshot.
         -- Accuracy jobs are stored and processed serially so they can never
         -- compete with the next move-analysis request.
@@ -1841,9 +2008,20 @@ task.spawn(function()
 
                     -- Analyze every detected ply. White and Black are stored
                     -- separately so neither side is omitted.
+                    local preResult = nil
+                    if previousSnapshot.fen == state.AccuracyBaselineFen
+                        and type(state.AccuracyBaselineResult) == "table" then
+                        preResult = state.AccuracyBaselineResult
+                    elseif previousSnapshot.fen == state.LastEngineFen
+                        and type(state.LastEngineResult) == "table" then
+                        preResult = state.LastEngineResult
+                    end
+
                     state.PendingAccuracy = {
                         generation = state.AccuracyGeneration,
-                        fen = previousSnapshot.fen,
+                        preFen = previousSnapshot.fen,
+                        postFen = snapshot.fen,
+                        preResult = preResult,
                         uci = move.uci,
                         side = move.side,
                         playedMove = move.from .. "-" .. move.to,
@@ -1882,12 +2060,31 @@ task.spawn(function()
             end
         end
 
-        -- Accuracy runs only after the live move analysis has had priority.
-        -- Since this is synchronous, there can only be one accuracy job at a time.
+        -- Accuracy runs after the live move analysis has had priority.
+        -- If it is now the player's turn, analyzeCurrent() already gave us
+        -- the post-move evaluation, so no second accuracy request is needed.
         if state.PendingAccuracy then
             local job = state.PendingAccuracy
             state.PendingAccuracy = nil
-            processAccuracyJob(job)
+
+            local suppliedPostResult = nil
+
+            -- If ensureAccuracyBaseline() just analyzed this post-move
+            -- position (this happens after one of our own moves), reuse it.
+            if job.postFen == state.AccuracyBaselineFen
+                and type(state.AccuracyBaselineResult) == "table" then
+                suppliedPostResult = state.AccuracyBaselineResult
+            elseif currentMatch
+                and snapshot
+                and job.postFen == snapshot.fen
+                and state.LastEngineFen == snapshot.fen
+                and type(state.LastEngineResult) == "table" then
+                -- After an opponent move, analyzeCurrent() already analyzed
+                -- the exact resulting position, so reuse that too.
+                suppliedPostResult = state.LastEngineResult
+            end
+
+            processAccuracyJob(job, suppliedPostResult)
         end
 
         state.LastSnapshot = snapshot
