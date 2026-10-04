@@ -41,7 +41,7 @@ local CONFIG_FILE = "prometheus_stockfish_config.json"
 local SERVER_LIST_LIMIT = 50
 local SERVER_SCAN_PAGES = 5
 local SERVER_HOP_DELAY = 0.8
-local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/prometheus_stockfish_final_github_keepiy.lua"
+local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/stockfish_online_api.lua"
 
 local executorEnv = getgenv and getgenv() or _G
 local executorSyn = type(executorEnv.syn) == "table" and executorEnv.syn or nil
