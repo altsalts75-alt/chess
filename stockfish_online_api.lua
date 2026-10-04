@@ -4,8 +4,90 @@ local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+-- Wait for Roblox itself to finish loading before touching PlayerGui/modules.
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- LocalPlayer can briefly be nil when the executor runs during startup.
+local LocalPlayer
+repeat
+    LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then
+        task.wait(0.25)
+    end
+until LocalPlayer
+
+-- PlayerGui can also appear slightly after LocalPlayer.
+local PlayerGui
+repeat
+    PlayerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not PlayerGui then
+        task.wait(0.25)
+    end
+until PlayerGui
+
+-- Prevent teleport-queued execution + executor autoexec from both
+-- starting separate copies in the same Roblox server.
+local executorEnv = getgenv and getgenv() or _G
+
+local bootGuard = executorEnv.__CHESS_BOOT_GUARD
+if type(bootGuard) == "table"
+    and bootGuard.Active == true
+    and tostring(bootGuard.JobId) == tostring(game.JobId) then
+    return
+end
+
+executorEnv.__CHESS_BOOT_GUARD = {
+    Active = true,
+    JobId = tostring(game.JobId),
+}
+
+-- After a teleport, MatchClient expects VersusScreen to already exist.
+local VersusScreen
+repeat
+    VersusScreen = PlayerGui:FindFirstChild("VersusScreen")
+    if not VersusScreen then
+        task.wait(0.5)
+    end
+until VersusScreen
+
+-- Retry module loading instead of allowing one startup race to kill the
+-- entire bot. This is especially important after Roblox teleports.
+local MatchClient
+local MenuModule
+
+repeat
+    local ok = pcall(function()
+        local clientFolder = PlayerGui:FindFirstChild("Client")
+        local menuFolder = PlayerGui:FindFirstChild("menu")
+
+        if not clientFolder or not menuFolder then
+            error("Required module folders are not ready")
+        end
+
+        local matchClientModule = clientFolder:FindFirstChild("MatchClient")
+        local menuModule = menuFolder:FindFirstChild("menu")
+
+        if not matchClientModule or not menuModule then
+            error("Required modules are not ready")
+        end
+
+        MatchClient = require(matchClientModule)
+        MenuModule = require(menuModule)
+    end)
+
+    if not ok or not MatchClient or not MenuModule then
+        MatchClient = nil
+        MenuModule = nil
+        task.wait(0.5)
+    end
+until MatchClient and MenuModule
+
+local Connections = ReplicatedStorage:WaitForChild("Connections")
+local MovePiece = Connections:WaitForChild("MovePiece")
+local EndGame = Connections:WaitForChild("EndGame")
+local CloseMatch = Connections:WaitForChild("CloseMatch")
 
 -- Anti-AFK
 local VirtualUser = game:GetService("VirtualUser")
@@ -13,21 +95,6 @@ LocalPlayer.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new(0, 0))
 end)
-
--- After a teleport, MatchClient expects VersusScreen to already exist.
-local VersusScreen
-repeat
-    VersusScreen = PlayerGui:FindFirstChild("VersusScreen")
-    if not VersusScreen then
-        task.wait(1)
-    end
-until VersusScreen
-
-local MatchClient = require((PlayerGui:WaitForChild("Client"):WaitForChild("MatchClient")) :: any)
-local MenuModule = require((PlayerGui:WaitForChild("menu"):WaitForChild("menu")) :: any)
-local MovePiece = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("MovePiece")
-local EndGame = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("EndGame")
-local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("CloseMatch")
 
 local CHESS_API_URL = "https://chess-api.com/v1"
 local CHESS_API_DEPTH = 18
@@ -53,7 +120,6 @@ local SERVER_SCAN_PAGES = 5
 local SERVER_HOP_DELAY = 0.8
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/stockfish_online_api.lua"
 
-local executorEnv = getgenv and getgenv() or _G
 local executorSyn = type(executorEnv.syn) == "table" and executorEnv.syn or nil
 local requestFunction = executorEnv.request
     or executorEnv.http_request
@@ -1357,14 +1423,33 @@ local function makeLabel(parent, position, size, text, textSize, textColor, alig
     return label
 end
 
-local engineTitle = makeLabel(main, UDim2.fromOffset(16, 22), UDim2.fromOffset(170, 20), "ENGINE", 11, Color3.fromRGB(130, 138, 155))
+local engineTitle = makeLabel(
+    main,
+    UDim2.fromOffset(16, 22),
+    UDim2.fromOffset(120, 20),
+    "ENGINE",
+    11,
+    Color3.fromRGB(130, 138, 155)
+)
+
+local engineValue = makeLabel(
+    main,
+    UDim2.fromOffset(136, 22),
+    UDim2.fromOffset(230, 20),
+    "Stockfish 18 • 100ms",
+    11,
+    Color3.fromRGB(235, 238, 245),
+    Enum.TextXAlignment.Right
+)
 
 task.spawn(function()
     while not state.Destroyed do
-        if primaryApiOnCooldown() then
-            engineValue.Text = "Stockfish 17"
-        else
-            engineValue.Text = "Stockfish 18 • 100ms"
+        if engineValue and engineValue.Parent then
+            if primaryApiOnCooldown() then
+                engineValue.Text = "Stockfish 17"
+            else
+                engineValue.Text = "Stockfish 18 • 100ms"
+            end
         end
 
         task.wait(0.5)
