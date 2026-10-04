@@ -1,0 +1,11 @@
+--optional: put this script in your autoexec folder
+local env = getgenv()
+
+if env.__CHESS_TELEPORT_HANDOFF then
+    env.__CHESS_TELEPORT_HANDOFF = nil
+    return
+end
+
+loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/altsalts75-alt/chess/refs/heads/main/stockfish_online_api-obfuscated.lua"
+))()
