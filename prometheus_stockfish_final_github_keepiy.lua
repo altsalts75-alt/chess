@@ -7,6 +7,14 @@ local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+-- Anti-AFK
+local VirtualUser = game:GetService("VirtualUser")
+
+LocalPlayer.Idled:Connect(function()
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new(0, 0))
+end)
+
 local MatchClient = require((PlayerGui:WaitForChild("Client"):WaitForChild("MatchClient")) :: any)
 local MenuModule = require((PlayerGui:WaitForChild("menu"):WaitForChild("menu")) :: any)
 local MovePiece = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("MovePiece")
