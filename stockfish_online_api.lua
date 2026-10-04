@@ -32,10 +32,19 @@ local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("C
 local CHESS_API_URL = "https://chess-api.com/v1"
 local CHESS_API_DEPTH = 18
 local CHESS_API_MAX_THINKING_MS = 100
-local API_REQUEST_GAP = 1.0
-local API_FAILURE_BACKOFF = 3.0
-local API_MAX_REQUESTS_PER_MINUTE = 18
-local API_HIGH_USAGE_COOLDOWN = 60
+-- chess-api.com does not publish a numeric HIGH_USAGE quota. Keep a strict
+-- total request budget anyway, and make the budget persist across teleports.
+local API_NORMAL_REQUEST_GAP = 3.0
+local API_NORMAL_MAX_REQUESTS_PER_MINUTE = 20
+local API_RECOVERY_REQUEST_GAP = 5.0
+local API_RECOVERY_MAX_REQUESTS_PER_MINUTE = 10
+local API_RECOVERY_DEPTH = 12
+local API_RECOVERY_MAX_THINKING_MS = 50
+local API_FAILURE_BACKOFF = 5.0
+local API_HIGH_USAGE_COOLDOWN = 15
+local API_RECOVERY_MODE_DURATION = 180
+local API_CACHE_TTL = 600
+local API_CACHE_MAX_ENTRIES = 300
 local CONFIG_FILE = "prometheus_stockfish_config.json"
 local SERVER_LIST_LIMIT = 50
 local SERVER_SCAN_PAGES = 5
@@ -48,6 +57,32 @@ local requestFunction = executorEnv.request
     or executorEnv.http_request
     or (executorSyn and executorSyn.request)
 local AutoPlayState = executorEnv
+
+-- Persist API usage state/cache through teleports. This reduces repeated
+-- opening-position requests and prevents a fresh script instance from
+-- immediately resetting the usage limiter.
+local sharedApi = executorEnv.__CHESS_API_STATE
+if type(sharedApi) ~= "table" then
+    sharedApi = {
+        RequestTimes = {},
+        Cache = {},
+        NextRequestAt = 0,
+        HighUsageUntil = 0,
+        RecoveryUntil = 0,
+    }
+    executorEnv.__CHESS_API_STATE = sharedApi
+end
+sharedApi.RequestTimes = type(sharedApi.RequestTimes) == "table" and sharedApi.RequestTimes or {}
+sharedApi.Cache = type(sharedApi.Cache) == "table" and sharedApi.Cache or {}
+sharedApi.NextRequestAt = tonumber(sharedApi.NextRequestAt) or 0
+sharedApi.HighUsageUntil = tonumber(sharedApi.HighUsageUntil) or 0
+sharedApi.RecoveryUntil = tonumber(sharedApi.RecoveryUntil) or 0
+
+-- Wall-clock seconds persist correctly across Roblox teleports/new script
+-- executions. `os.clock()` does not provide that guarantee.
+local function apiNow()
+    return os.time()
+end
 
 -- Prevent a teleport-queued execution and an executor autoexec from both
 -- starting the bot in the same Roblox server. Only one instance per JobId
@@ -245,8 +280,8 @@ local state = {
 
     -- Public API protection. These are runtime-only and never saved to the
     -- user's config, so Auto Ranked ON/OFF is unaffected.
-    ApiHighUsageUntil = 0,
-    ApiRequestTimes = {},
+    ApiHighUsageUntil = sharedApi.HighUsageUntil,
+    ApiRequestTimes = sharedApi.RequestTimes,
 
     -- Ranked-cycle runtime guards. These do not alter the saved AutoRanked
     -- setting; only the user's toggle/config does that.
@@ -515,30 +550,93 @@ local apiRequestBusy = false
 local apiNextRequestAt = 0
 
 local function pruneApiRequestTimes(now)
-    now = now or os.clock()
-    local cutoff = now - 60
-    local times = state.ApiRequestTimes
-    local first = 1
-
-    while times[first] and times[first] < cutoff do
-        first = first + 1
-    end
-
-    if first > 1 then
-        local kept = {}
-        for i = first, #times do
-            kept[#kept + 1] = times[i]
+    local times = sharedApi.RequestTimes
+    local kept = {}
+    for _, t in ipairs(times) do
+        if now - t < 60 then
+            kept[#kept + 1] = t
         end
-        state.ApiRequestTimes = kept
-        times = kept
     end
-
-    return times
+    sharedApi.RequestTimes = kept
+    state.ApiRequestTimes = kept
+    return kept
 end
 
 local function isHighUsageText(value)
     return type(value) == "string"
         and string.find(string.upper(value), "HIGH_USAGE", 1, true) ~= nil
+end
+
+local function apiProfile()
+    if apiNow() < sharedApi.RecoveryUntil then
+        return API_RECOVERY_REQUEST_GAP, API_RECOVERY_MAX_REQUESTS_PER_MINUTE,
+            API_RECOVERY_DEPTH, API_RECOVERY_MAX_THINKING_MS
+    end
+    return API_NORMAL_REQUEST_GAP, API_NORMAL_MAX_REQUESTS_PER_MINUTE,
+        CHESS_API_DEPTH, CHESS_API_MAX_THINKING_MS
+end
+
+local function apiCacheKey(payload, depth, thinkingMs)
+    return table.concat({
+        tostring(payload.fen or ""),
+        tostring(payload.searchmoves or ""),
+        tostring(depth),
+        tostring(thinkingMs),
+    }, "|")
+end
+
+local function getCachedApiResult(key)
+    local entry = sharedApi.Cache[key]
+    if type(entry) ~= "table" then
+        return nil
+    end
+
+    if tonumber(entry.expiresAt) and apiNow() >= entry.expiresAt then
+        sharedApi.Cache[key] = nil
+        return nil
+    end
+
+    entry.lastUsed = apiNow()
+    return entry.result
+end
+
+local function storeCachedApiResult(key, result)
+    sharedApi.Cache[key] = {
+        result = result,
+        expiresAt = apiNow() + API_CACHE_TTL,
+        lastUsed = apiNow(),
+    }
+
+    local entries = {}
+    for k, entry in pairs(sharedApi.Cache) do
+        if type(entry) ~= "table" or apiNow() >= (tonumber(entry.expiresAt) or 0) then
+            sharedApi.Cache[k] = nil
+        else
+            entries[#entries + 1] = {
+                key = k,
+                lastUsed = tonumber(entry.lastUsed) or 0,
+            }
+        end
+    end
+
+    while #entries > API_CACHE_MAX_ENTRIES do
+        local oldestIndex = 1
+        for i = 2, #entries do
+            if entries[i].lastUsed < entries[oldestIndex].lastUsed then
+                oldestIndex = i
+            end
+        end
+        sharedApi.Cache[entries[oldestIndex].key] = nil
+        table.remove(entries, oldestIndex)
+    end
+end
+
+local function markHighUsage()
+    local now = apiNow()
+    sharedApi.HighUsageUntil = math.max(sharedApi.HighUsageUntil, now + API_HIGH_USAGE_COOLDOWN)
+    sharedApi.RecoveryUntil = math.max(sharedApi.RecoveryUntil, now + API_RECOVERY_MODE_DURATION)
+    sharedApi.NextRequestAt = math.max(sharedApi.NextRequestAt, now + API_RECOVERY_REQUEST_GAP)
+    state.ApiHighUsageUntil = sharedApi.HighUsageUntil
 end
 
 local function requestStockfish(payload)
@@ -547,14 +645,25 @@ local function requestStockfish(payload)
     end
 
     local requestKind = payload.kind == "accuracy" and "accuracy" or "engine"
+    local now = apiNow()
 
-    if requestKind == "accuracy" and os.clock() < state.ApiHighUsageUntil then
+    -- Accuracy is optional. During a usage event/recovery period, drop it
+    -- completely so the engine move requests are the only traffic sent.
+    if requestKind == "accuracy" and (
+        now < sharedApi.HighUsageUntil
+        or now < sharedApi.RecoveryUntil
+    ) then
         error("ACCURACY_COOLDOWN")
     end
 
-    -- One serialized lane for the whole API. Accuracy requests also have a
-    -- rolling-minute budget and yield first; engine requests remain the
-    -- priority needed to play the game.
+    local gap, maxPerMinute, depth, thinkingMs = apiProfile()
+    local key = apiCacheKey(payload, depth, thinkingMs)
+    local cached = getCachedApiResult(key)
+    if cached then
+        state.ApiHighUsageUntil = sharedApi.HighUsageUntil
+        return cached
+    end
+
     while apiRequestBusy do
         if state.Destroyed then
             error("Script destroyed while waiting for API request")
@@ -565,29 +674,49 @@ local function requestStockfish(payload)
     apiRequestBusy = true
 
     local ok, result = xpcall(function()
-        local waitTime = apiNextRequestAt - os.clock()
-        if waitTime > 0 then
-            task.wait(waitTime)
-        end
-
         while true do
-            local now = os.clock()
-            local times = pruneApiRequestTimes(now)
+            local tnow = apiNow()
+            local times = pruneApiRequestTimes(tnow)
+            local waitFor = sharedApi.NextRequestAt - tnow
 
-            if #times < API_MAX_REQUESTS_PER_MINUTE or requestKind == "engine" then
+            if #times < maxPerMinute and waitFor <= 0 then
                 break
             end
 
-            -- Never delay engine move generation for an optional accuracy
-            -- request. Simply skip the accuracy calculation once the local
-            -- budget is full; the move itself can still be played normally.
-            error("ACCURACY_LOCAL_RATE_LIMIT")
+            local budgetWait = #times >= maxPerMinute
+                and math.max(0, (times[1] or tnow) + 60 - tnow)
+                or 0
+            local targetWait = math.max(waitFor, budgetWait)
+            if targetWait > 0 then
+                task.wait(math.min(targetWait, 1.0))
+            else
+                task.wait(0.03)
+            end
+        end
+
+        -- Re-check recovery profile after waiting for the limiter. A HIGH_USAGE
+        -- event from another request may have switched the whole process to the
+        -- lower-cost recovery profile while this request was waiting.
+        local finalGap, finalMax, finalDepth, finalThinking = apiProfile()
+        depth = finalDepth
+        thinkingMs = finalThinking
+        key = apiCacheKey(payload, depth, thinkingMs)
+
+        local lateCached = getCachedApiResult(key)
+        if lateCached then
+            return lateCached
+        end
+
+        local requestNow = apiNow()
+        local finalTimes = pruneApiRequestTimes(requestNow)
+        if #finalTimes >= finalMax then
+            error("API_LOCAL_RATE_LIMIT")
         end
 
         local apiPayload = {
             fen = payload.fen,
-            depth = CHESS_API_DEPTH,
-            maxThinkingTime = CHESS_API_MAX_THINKING_MS,
+            depth = depth,
+            maxThinkingTime = thinkingMs,
             taskId = HttpService:GenerateGUID(false),
         }
 
@@ -595,7 +724,9 @@ local function requestStockfish(payload)
             apiPayload.searchmoves = payload.searchmoves
         end
 
-        table.insert(state.ApiRequestTimes, os.clock())
+        table.insert(sharedApi.RequestTimes, apiNow())
+        state.ApiRequestTimes = sharedApi.RequestTimes
+        sharedApi.NextRequestAt = apiNow() + finalGap
 
         local response = requestFunction({
             Url = CHESS_API_URL,
@@ -614,7 +745,7 @@ local function requestStockfish(payload)
         local responseBody = response.Body or response.body or ""
 
         if statusCode == 429 or isHighUsageText(responseBody) then
-            state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+            markHighUsage()
             error("HIGH_USAGE")
         end
 
@@ -637,7 +768,7 @@ local function requestStockfish(payload)
         if decoded.error then
             local apiError = tostring(decoded.error)
             if isHighUsageText(apiError) then
-                state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+                markHighUsage()
                 error("HIGH_USAGE")
             end
             if string.find(apiError, "FEN", 1, true) then
@@ -649,34 +780,39 @@ local function requestStockfish(payload)
         if decoded.type == "error" then
             local apiError = tostring(decoded.text or decoded.error or "unknown error")
             if isHighUsageText(apiError) then
-                state.ApiHighUsageUntil = os.clock() + API_HIGH_USAGE_COOLDOWN
+                markHighUsage()
                 error("HIGH_USAGE")
             end
-            if string.find(apiError, "FEN", 1, true) or string.find(apiError, "FEN_VALIDATION", 1, true) then
+            if string.find(apiError, "FEN", 1, true)
+                or string.find(apiError, "FEN_VALIDATION", 1, true) then
                 error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
             end
             error("Chess API error: " .. apiError)
         end
 
-        apiNextRequestAt = os.clock() + API_REQUEST_GAP
+        storeCachedApiResult(key, decoded)
         return decoded
     end, debug.traceback)
 
-    -- Even failed requests get a cooldown. HIGH_USAGE is additionally turned
-    -- into a longer circuit breaker for accuracy requests.
     if not ok then
         local message = tostring(result)
         if isHighUsageText(message) then
-            state.ApiHighUsageUntil = math.max(
-                state.ApiHighUsageUntil,
-                os.clock() + API_HIGH_USAGE_COOLDOWN
+            markHighUsage()
+            -- Keep the next attempt well away from this rejection.
+            sharedApi.NextRequestAt = math.max(
+                sharedApi.NextRequestAt,
+                apiNow() + API_RECOVERY_REQUEST_GAP
+            )
+        else
+            sharedApi.NextRequestAt = math.max(
+                sharedApi.NextRequestAt,
+                apiNow() + API_FAILURE_BACKOFF
             )
         end
-        apiNextRequestAt = os.clock() + API_FAILURE_BACKOFF
-    else
-        apiNextRequestAt = math.max(apiNextRequestAt, os.clock() + API_REQUEST_GAP)
     end
 
+    state.ApiHighUsageUntil = sharedApi.HighUsageUntil
+    state.ApiRequestTimes = sharedApi.RequestTimes
     apiRequestBusy = false
 
     if not ok then
@@ -1305,9 +1441,11 @@ local function updateAnalysisUI(recommendation)
         scoreText
     )
 
+    local displayThinking = recommendation.thinkingMs or CHESS_API_MAX_THINKING_MS
     searchStatusLabel.Text = string.format(
-        "Depth %s  •  100ms max  •  %s",
+        "Depth %s  •  %sms max  •  %s",
         tostring(recommendation.depth or "?"),
+        tostring(displayThinking),
         recommendation.nps and (tostring(recommendation.nps) .. " NPS") or "Stockfish 18"
     )
 end
@@ -1330,6 +1468,19 @@ local function analyzeCurrent(board)
 
     if not ok or not result then
         local reason = tostring(result or "unknown error")
+        if isHighUsageText(reason) then
+            local fallback = fallbackAnalysis(board)
+            if fallback then
+                fallback.board = board
+                fallback.key = generationKey
+                fallback.positionFen = positionFen
+                fallback.side = analysisSide
+                fallback.thinkingMs = 0
+                searchStatusLabel.Text = "API busy • fallback move"
+                state.Recommendation = fallback
+                return fallback
+            end
+        end
         if #reason > 52 then
             reason = string.sub(reason, 1, 52) .. "..."
         end
@@ -1461,7 +1612,7 @@ local function processAccuracyJob(job, suppliedPostResult)
 
     -- Never hammer the service after it has indicated HIGH_USAGE. Accuracy is
     -- optional; engine move generation always remains the priority.
-    if os.clock() < state.ApiHighUsageUntil then
+    if apiNow() < state.ApiHighUsageUntil then
         return false
     end
 
@@ -1569,7 +1720,7 @@ local function ensureAccuracyBaseline(board, snapshot)
     -- On the player's turn analyzeCurrent() will establish the baseline.
     -- When it is the opponent's turn, we need one initial position analysis
     -- so the first opponent move can also be scored correctly.
-    if isPlayerTurn(board) or os.clock() < state.ApiHighUsageUntil then
+    if isPlayerTurn(board) or apiNow() < state.ApiHighUsageUntil then
         return
     end
 
