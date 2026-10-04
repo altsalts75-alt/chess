@@ -1358,7 +1358,18 @@ local function makeLabel(parent, position, size, text, textSize, textColor, alig
 end
 
 local engineTitle = makeLabel(main, UDim2.fromOffset(16, 22), UDim2.fromOffset(170, 20), "ENGINE", 11, Color3.fromRGB(130, 138, 155))
-local engineValue = makeLabel(main, UDim2.fromOffset(190, 20), UDim2.fromOffset(140, 24), "Stockfish 18 • 100ms", 11, Color3.fromRGB(235, 238, 245), Enum.TextXAlignment.Right)
+
+task.spawn(function()
+    while not state.Destroyed do
+        if primaryApiOnCooldown() then
+            engineValue.Text = "Stockfish 17"
+        else
+            engineValue.Text = "Stockfish 18 • 100ms"
+        end
+
+        task.wait(0.5)
+    end
+end)
 
 local separator = Instance.new("Frame")
 separator.Size = UDim2.new(1, -32, 0, 1)
