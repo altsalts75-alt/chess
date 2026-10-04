@@ -243,6 +243,14 @@ local state = {
     PendingPlayKey = nil,
 }
 
+local function syncConfigFromState()
+    config.EngineSeconds = state.EngineSeconds
+    config.AccuracySeconds = state.AccuracySeconds
+    config.AutoPlay = state.Enabled
+    config.AutoRanked = state.AutoRanked
+    config.MenuKeyCode = state.MenuKeyCode.Name
+end
+
 if state.AutoRanked then
     state.Enabled = true
 end
@@ -258,6 +266,7 @@ executorEnv.__CHESS_CONFIG = {
 
 -- Install this only after `state` exists so the callback captures the
 -- correct local state value.
+
 Players.LocalPlayer.OnTeleport:Connect(function()
     if teleportCheck then
         return
@@ -265,16 +274,10 @@ Players.LocalPlayer.OnTeleport:Connect(function()
 
     teleportCheck = true
 
-    config.EngineSeconds = state.EngineSeconds
-    config.AccuracySeconds = state.AccuracySeconds
-    config.AutoPlay = state.Enabled
-    config.AutoRanked = state.AutoRanked
-    config.MenuKeyCode = state.MenuKeyCode.Name
-
+    syncConfigFromState()
     saveConfig()
 
     getgenv().__CHESS_TELEPORT_HANDOFF = true
-
     keepiy()
 end)
 
