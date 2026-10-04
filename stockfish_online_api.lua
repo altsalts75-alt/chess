@@ -675,33 +675,47 @@ end
 -- user preference is kept in AutoRankedUserSetting and is never overwritten
 -- by this function.
 local function applyApiCooldownState()
+    local now = apiNow()
     local cooldownUntil = tonumber(sharedApi.PrimaryCooldownUntil) or 0
     state.ApiHighUsageUntil = cooldownUntil
 
-    if cooldownUntil > apiNow() then
-        if state.AutoRankedUserSetting then
-            if state.AutoRanked then
-                state.AutoRanked = false
-                state.RankedQueuePending = false
-                state.RankedPostGame = false
-                state.RankedTeleporting = false
-                state.AutoRankedBusy = false
-            end
-        else
-            state.AutoRanked = false
-        end
-        return true, cooldownUntil - apiNow()
+    if cooldownUntil > now then
+        -- Temporarily suspend only the EFFECTIVE state. Do not destroy ranked
+        -- cycle information while a game is still active or while an EndGame
+        -- event is waiting to be processed.
+        state.AutoRanked = false
+        return true, cooldownUntil - now
     end
 
     -- Cooldown expired. Restore exactly the user's saved preference.
-    if state.AutoRanked ~= state.AutoRankedUserSetting then
-        state.AutoRanked = state.AutoRankedUserSetting
-        state.NextRankedAttempt = os.clock() + 1
-        state.RankedStartupReadyAt = os.clock() + 1
-        state.RankedQueuePending = false
-        state.RankedPostGame = false
-        state.RankedTeleporting = false
-        state.AutoRankedBusy = false
+    if state.AutoRankedUserSetting then
+        if not state.AutoRanked then
+            state.AutoRanked = true
+        end
+
+        -- Re-synchronize the ranked runtime state after an OFF -> ON
+        -- transition. Never clear RankedPostGame here: an EndGame event may
+        -- have happened during the cooldown and be waiting for the next hop.
+        local currentMatch = MatchClient.currentMatch
+        if currentMatch then
+            local currentId = tostring(currentMatch.id)
+            state.RankedMatchActive = true
+            state.RankedActiveMatchId = currentId
+            state.RankedEndHandledId = nil
+            state.RankedQueuePending = false
+            state.RankedPostGame = false
+            state.RankedTeleporting = false
+            state.AutoRankedBusy = false
+        elseif not state.RankedPostGame and not state.RankedTeleporting then
+            state.RankedQueuePending = false
+            state.AutoRankedBusy = false
+            state.NextRankedAttempt = math.max(state.NextRankedAttempt, os.clock() + 0.75)
+            state.RankedStartupReadyAt = math.max(state.RankedStartupReadyAt, os.clock() + 0.75)
+        end
+    else
+        -- User preference is OFF. Keep the effective state OFF and make sure
+        -- no stale ranked lock survives a later manual ON transition.
+        state.AutoRanked = false
     end
 
     return false, 0
@@ -1464,19 +1478,39 @@ autoRankedToggle = makeToggle(100, "Auto Ranked Loop", state.AutoRanked, functio
         autoPlayToggle.button.Text = "ON"
         autoPlayToggle.button.BackgroundColor3 = Color3.fromRGB(42, 160, 105)
 
+        local currentMatch = MatchClient.currentMatch
         state.RankedQueuePending = false
-        state.RankedPostGame = false
         state.RankedTeleporting = false
         state.AutoRankedBusy = false
         state.NextRankedAttempt = os.clock() + 0.75
         state.RankedStartupReadyAt = os.clock() + 0.75
-        state.RankedMatchActive = MatchClient.currentMatch ~= nil
-        state.RankedActiveMatchId = MatchClient.currentMatch and tostring(MatchClient.currentMatch.id) or nil
+
+        if currentMatch then
+            -- Turning Auto Ranked back ON while a game is already active must
+            -- resume protection for that exact match.
+            state.RankedMatchActive = true
+            state.RankedActiveMatchId = tostring(currentMatch.id)
+            state.RankedEndHandledId = nil
+            state.RankedPostGame = false
+        else
+            -- No active match: clear stale cycle locks so OFF -> ON always
+            -- creates a fresh queue opportunity.
+            state.RankedMatchActive = false
+            state.RankedActiveMatchId = nil
+            state.RankedPostGame = false
+            state.RankedEndHandledId = nil
+        end
     else
+        -- Manual OFF is only a user preference change. Clear runtime locks
+        -- so a later manual ON starts from a clean state.
         state.RankedQueuePending = false
         state.RankedPostGame = false
         state.RankedTeleporting = false
         state.AutoRankedBusy = false
+        if MatchClient.currentMatch == nil then
+            state.RankedMatchActive = false
+            state.RankedActiveMatchId = nil
+        end
     end
 
     autoRankedToggle.value = state.AutoRanked
@@ -1620,9 +1654,41 @@ local function updateAnalysisUI(recommendation)
     )
 end
 
+local hopToMostPopulatedServer
+
 local function updateCooldownUI()
     while not state.Destroyed do
         local active, remaining = applyApiCooldownState()
+
+        -- If EndGame happened while the primary API was cooling down, the
+        -- normal EndGame handler intentionally left RankedPostGame set. Once
+        -- recovery finishes, perform the same server hop that would normally
+        -- happen immediately after a game.
+        if not active
+            and state.AutoRankedUserSetting
+            and state.AutoRanked
+            and state.RankedPostGame
+            and not state.RankedTeleporting
+            and not MatchClient.currentMatch
+            and not state.RankedQueuePending
+            and not state.RankedMatchActive
+            and not state.AutoRankedBusy then
+            state.RankedPostGame = false
+            state.RankedTeleporting = true
+            state.AutoRankedBusy = true
+            task.spawn(function()
+                local callOk, result = pcall(function()
+                    return hopToMostPopulatedServer()
+                end)
+                if not callOk or not result then
+                    if not state.Destroyed then
+                        state.RankedTeleporting = false
+                        state.AutoRankedBusy = false
+                        state.NextRankedAttempt = os.clock() + 2
+                    end
+                end
+            end)
+        end
 
         if active then
             searchStatusLabel.Text = "API cooldown: " .. formatCooldown(remaining)
@@ -1998,7 +2064,7 @@ local function findMostPopulatedServer()
     return best
 end
 
-local function hopToMostPopulatedServer()
+hopToMostPopulatedServer = function()
     local target = findMostPopulatedServer()
     if not target then
         return false
@@ -2126,7 +2192,7 @@ local function queueRanked()
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
-    if not state.AutoRanked or state.Destroyed then
+    if state.Destroyed then
         return
     end
 
@@ -2201,15 +2267,26 @@ EndGame.OnClientEvent:Connect(function(matchId)
             state.NextRankedAttempt = os.clock() + 1
 
         -- Never start another ranked queue/server hop while the primary API is
-        -- cooling down. Auto Ranked may be temporarily OFF at runtime, but the
-        -- user's saved preference remains state.AutoRankedUserSetting.
-        applyApiCooldownState()
-        if not state.AutoRanked then
-            state.RankedPostGame = false
+        -- cooling down. The EndGame cleanup above still runs even if Auto Ranked
+        -- was temporarily OFF, so a match ending during cooldown cannot leave a
+        -- stale RankedMatchActive/AutoRankedBusy lock behind.
+        local cooldownActive = primaryApiOnCooldown()
+        if not state.AutoRankedUserSetting or cooldownActive then
+            state.RankedTeleporting = false
             state.AutoRankedBusy = false
+            -- Keep RankedPostGame=true when the user's setting is ON during
+            -- cooldown. The cooldown watcher will consume it after recovery.
+            if state.AutoRankedUserSetting and cooldownActive then
+                state.RankedPostGame = true
+            else
+                state.RankedPostGame = false
+            end
+            applyApiCooldownState()
             return
         end
 
+        state.AutoRanked = true
+        state.RankedPostGame = false
         state.RankedTeleporting = true
         state.AutoRankedBusy = true
         local hopOk = false
@@ -2231,7 +2308,8 @@ end)
 
 TeleportService.TeleportInitFailed:Connect(function()
     applyApiCooldownState()
-    if state.AutoRanked and not state.Destroyed then
+    if state.AutoRankedUserSetting and not primaryApiOnCooldown() and not state.Destroyed then
+        state.AutoRanked = true
         state.RankedTeleporting = false
         state.RankedPostGame = false
         state.RankedQueuePending = false
@@ -2296,13 +2374,16 @@ task.spawn(function()
 
         -- A real MatchClient.currentMatch means matchmaking succeeded. While it
         -- exists, the ranked queue is considered active and cannot fire again.
-        if currentMatch and not state.RankedPostGame and not state.RankedTeleporting then
+        if currentMatch and not state.RankedTeleporting then
+            -- A real current match always wins over stale RankedPostGame state.
+            -- This is also what lets OFF -> ON during a match recover cleanly.
             if not state.RankedMatchActive
                 or tostring(state.RankedActiveMatchId) ~= gameId then
                 state.RankedMatchActive = true
                 state.RankedActiveMatchId = gameId
                 state.RankedEndHandledId = nil
             end
+            state.RankedPostGame = false
             state.RankedQueuePending = false
             state.AutoRankedBusy = false
         end
