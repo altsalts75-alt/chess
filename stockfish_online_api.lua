@@ -1441,16 +1441,45 @@ local function hopToMostPopulatedServer()
     end)
 end
 
+local function findRankedButton()
+    local menuGui = PlayerGui:FindFirstChild("menu")
+    if not menuGui then
+        return nil
+    end
+
+    local frame = menuGui:FindFirstChild("Frame")
+    local ranked = frame and frame:FindFirstChild("Ranked")
+    local rankedFrame = ranked and ranked:FindFirstChild("Frame")
+    local button = rankedFrame and rankedFrame:FindFirstChild("button")
+
+    if button and button:IsA("GuiButton") then
+        return button
+    end
+
+    return nil
+end
+
 local function queueRanked()
-    if not state.AutoRanked
-        or MatchClient.currentMatch ~= nil
-        or state.AutoRankedBusy then
+    if not state.AutoRanked or MatchClient.currentMatch ~= nil or state.AutoRankedBusy then
         return false
     end
 
     local menuGui = PlayerGui:FindFirstChild("menu")
-
     if not menuGui or not menuGui.Enabled then
+        return false
+    end
+
+    local button = findRankedButton()
+    if not button or not button.Visible then
+        return false
+    end
+
+    local matchfinding = nil
+    pcall(function()
+        matchfinding = require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
+    end)
+
+    if matchfinding and matchfinding.inque then
         return false
     end
 
@@ -1458,54 +1487,33 @@ local function queueRanked()
         return false
     end
 
-    local matchfinding = getMatchfinding()
-
-    if not matchfinding then
-        state.NextRankedAttempt = os.clock() + 2
-        return false
-    end
-
-    -- If we're already searching, leave the existing queue alone.
-    if matchfinding.inque then
-        return true
-    end
-
     state.AutoRankedBusy = true
-    state.NextRankedAttempt = os.clock() + 3
+    state.NextRankedAttempt = os.clock() + 5
 
-    local ok, err = pcall(function()
-        -- This is the same function used by the game's actual Ranked button.
-        matchfinding:toggleque()
-    end)
+    local fired = false
 
-    if not ok then
-        warn("[ChessAuto] Ranked queue failed: " .. tostring(err))
-        state.AutoRankedBusy = false
-        return false
+    if type(firesignal) == "function" then
+        local ok = pcall(firesignal, button.Activated)
+        fired = ok
+    elseif type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, button.Activated)
+        if ok and type(connections) == "table" then
+            for _, connection in ipairs(connections) do
+                if type(connection.Fire) == "function" then
+                    pcall(connection.Fire, connection)
+                    fired = true
+                end
+            end
+        end
     end
 
-    -- Give the game's matchmaking module time to update its state.
-    task.spawn(function()
-        local deadline = os.clock() + 3
-
-        while os.clock() < deadline and not state.Destroyed do
-            if matchfinding.inque then
-                state.AutoRankedBusy = false
-                return
-            end
-
-            if MatchClient.currentMatch ~= nil then
-                state.AutoRankedBusy = false
-                return
-            end
-
-            task.wait(0.1)
+    task.delay(0.35, function()
+        if not state.Destroyed then
+            state.AutoRankedBusy = false
         end
-
-        state.AutoRankedBusy = false
     end)
 
-    return true
+    return fired
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
