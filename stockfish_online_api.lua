@@ -2,25 +2,16 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- Anti-AFK
-local VirtualUser = game:GetService("VirtualUser")
-LocalPlayer.Idled:Connect(function()
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new(0, 0))
-end)
-
--- Wait for the game's UI to finish initializing after teleport.
--- MatchClient requires VersusScreen to already exist.
+-- After a teleport, MatchClient expects VersusScreen to already exist.
+-- Wait for it before requiring MatchClient to avoid the intermittent
+-- post-teleport initialization failure / black screen.
 local VersusScreen
-
 repeat
     VersusScreen = PlayerGui:FindFirstChild("VersusScreen")
-
     if not VersusScreen then
         task.wait(1)
     end
@@ -34,13 +25,10 @@ local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("C
 
 local CHESS_API_URL = "https://chess-api.com/v1"
 local CHESS_API_DEPTH = 18
-local CHESS_API_MAX_THINKING_MS = 100
+local CHESS_API_MAX_THINKING_MS = 100 -- free API limit; increase if your plan permits more
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
-local SERVER_LIST_LIMIT = 50
-local SERVER_SCAN_PAGES = 5
-local SERVER_HOP_DELAY = 0.8
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/stockfish_online_api.lua"
 
 local executorEnv = getgenv and getgenv() or _G
@@ -74,6 +62,7 @@ local config = {
     AccuracySeconds = DEFAULT_ACCURACY_SECONDS,
     AutoPlay = false,
     AutoRanked = false,
+    GPUOptimization = false,
     MenuKeyCode = "RightShift",
     XScale = 0,
     XOffset = 24,
@@ -117,6 +106,10 @@ local function loadConfig()
         config.AutoRanked = saved.AutoRanked
     end
 
+    if type(saved.GPUOptimization) == "boolean" then
+        config.GPUOptimization = saved.GPUOptimization
+    end
+
     if type(saved.MenuKeyCode) == "string" then
         local enumValue = Enum.KeyCode[saved.MenuKeyCode]
         if enumValue then
@@ -145,27 +138,24 @@ loadConfig()
 -- Keep the toggle in the executor environment too. This survives a
 -- teleport re-execution even when the workspace config is not yet available.
 local runtimeConfig = executorEnv.__CHESS_CONFIG
-
 if type(runtimeConfig) == "table" then
     if type(runtimeConfig.EngineSeconds) == "number" then
         config.EngineSeconds = math.clamp(runtimeConfig.EngineSeconds, 0.5, 30)
     end
-
     if type(runtimeConfig.AccuracySeconds) == "number" then
         config.AccuracySeconds = math.clamp(runtimeConfig.AccuracySeconds, 0.2, 10)
     end
-
     if type(runtimeConfig.AutoPlay) == "boolean" then
         config.AutoPlay = runtimeConfig.AutoPlay
     end
-
     if type(runtimeConfig.AutoRanked) == "boolean" then
         config.AutoRanked = runtimeConfig.AutoRanked
     end
-
+    if type(runtimeConfig.GPUOptimization) == "boolean" then
+        config.GPUOptimization = runtimeConfig.GPUOptimization
+    end
     if type(runtimeConfig.MenuKeyCode) == "string" then
         local enumValue = Enum.KeyCode[runtimeConfig.MenuKeyCode]
-
         if enumValue then
             config.MenuKeyCode = runtimeConfig.MenuKeyCode
         end
@@ -178,6 +168,7 @@ local function saveConfig()
         AccuracySeconds = config.AccuracySeconds,
         AutoPlay = config.AutoPlay,
         AutoRanked = config.AutoRanked,
+        GPUOptimization = config.GPUOptimization,
         MenuKeyCode = config.MenuKeyCode,
         Position = {
             XScale = config.XScale,
@@ -192,6 +183,7 @@ local function saveConfig()
         AccuracySeconds = payload.AccuracySeconds,
         AutoPlay = payload.AutoPlay,
         AutoRanked = payload.AutoRanked,
+        GPUOptimization = payload.GPUOptimization,
         MenuKeyCode = payload.MenuKeyCode,
     }
 
@@ -243,32 +235,90 @@ local state = {
     AutoRankedBusy = false,
     NextRankedAttempt = 0,
     PendingPlayKey = nil,
+    EngineRetryAt = 0,
+    NeedsFreshQueue = true,
+    QueueStartedAt = 0,
 }
-
-local function syncConfigFromState()
-    config.EngineSeconds = state.EngineSeconds
-    config.AccuracySeconds = state.AccuracySeconds
-    config.AutoPlay = state.Enabled
-    config.AutoRanked = state.AutoRanked
-    config.MenuKeyCode = state.MenuKeyCode.Name
-end
 
 if state.AutoRanked then
     state.Enabled = true
 end
 config.AutoPlay = state.Enabled
 
+local GPUConnections = {}
+
+local function disableGPUOptimization()
+    state.GPUOptimization = false
+
+    for _, connection in ipairs(GPUConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    GPUConnections = {}
+
+    pcall(function()
+        game:GetService("RunService"):Set3dRenderingEnabled(true)
+    end)
+
+    pcall(function()
+        if type(setfpscap) == "function" then
+            setfpscap(360)
+        end
+    end)
+end
+
+local function enableGPUOptimization()
+    if state.GPUOptimization then
+        return
+    end
+
+    state.GPUOptimization = true
+
+    if type(setfpscap) ~= "function" then
+        return
+    end
+
+    GPUConnections[#GPUConnections + 1] = UserInputService.WindowFocusReleased:Connect(function()
+        if not state.GPUOptimization or state.Destroyed then
+            return
+        end
+
+        pcall(function()
+            game:GetService("RunService"):Set3dRenderingEnabled(false)
+            setfpscap(5)
+        end)
+    end)
+
+    GPUConnections[#GPUConnections + 1] = UserInputService.WindowFocused:Connect(function()
+        if not state.GPUOptimization or state.Destroyed then
+            return
+        end
+
+        pcall(function()
+            game:GetService("RunService"):Set3dRenderingEnabled(true)
+            setfpscap(360)
+        end)
+    end)
+end
+
+local function setGPUOptimization(enabled)
+    if enabled then
+        enableGPUOptimization()
+    else
+        disableGPUOptimization()
+    end
+end
+
 executorEnv.__CHESS_CONFIG = {
     EngineSeconds = config.EngineSeconds,
     AccuracySeconds = config.AccuracySeconds,
     AutoPlay = config.AutoPlay,
     AutoRanked = config.AutoRanked,
+    GPUOptimization = config.GPUOptimization,
     MenuKeyCode = config.MenuKeyCode,
 }
 
 -- Install this only after `state` exists so the callback captures the
 -- correct local state value.
-
 Players.LocalPlayer.OnTeleport:Connect(function()
     if teleportCheck then
         return
@@ -276,10 +326,15 @@ Players.LocalPlayer.OnTeleport:Connect(function()
 
     teleportCheck = true
 
-    syncConfigFromState()
-    saveConfig()
+    -- Capture the live UI state immediately before the teleport.
+    config.EngineSeconds = state.EngineSeconds
+    config.AccuracySeconds = state.AccuracySeconds
+    config.AutoPlay = state.Enabled
+    config.AutoRanked = state.AutoRanked
+    config.GPUOptimization = state.GPUOptimization
+    config.MenuKeyCode = state.MenuKeyCode.Name
 
-    getgenv().__CHESS_TELEPORT_HANDOFF = true
+    saveConfig()
     keepiy()
 end)
 
@@ -472,6 +527,29 @@ local function apiThinkingMs(seconds)
     return math.clamp(requested, 10, CHESS_API_MAX_THINKING_MS)
 end
 
+local API_REQUEST_GAP = 0.35
+local API_REQUEST_TIMEOUT = 15000
+local apiRequestBusy = false
+local apiNextRequestAt = 0
+
+local function acquireApiSlot()
+    while apiRequestBusy do
+        task.wait(0.03)
+    end
+
+    local waitFor = apiNextRequestAt - os.clock()
+    if waitFor > 0 then
+        task.wait(waitFor)
+    end
+
+    apiRequestBusy = true
+end
+
+local function releaseApiSlot()
+    apiRequestBusy = false
+    apiNextRequestAt = os.clock() + API_REQUEST_GAP
+end
+
 local function requestStockfish(payload)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
@@ -479,67 +557,69 @@ local function requestStockfish(payload)
 
     local apiPayload = {
         fen = payload.fen,
-        depth = math.clamp(
-            tonumber(payload.depth) or CHESS_API_DEPTH,
-            1,
-            18
-        ),
+        depth = math.clamp(tonumber(payload.depth) or CHESS_API_DEPTH, 1, 18),
         maxThinkingTime = math.clamp(
-            tonumber(payload.maxThinkingTime)
-                or apiThinkingMs(state.EngineSeconds),
+            tonumber(payload.maxThinkingTime) or apiThinkingMs(state.EngineSeconds),
             10,
             CHESS_API_MAX_THINKING_MS
         ),
         taskId = HttpService:GenerateGUID(false),
     }
 
-    if type(payload.searchmoves) == "string"
-        and payload.searchmoves ~= "" then
+    if type(payload.searchmoves) == "string" and payload.searchmoves ~= "" then
         apiPayload.searchmoves = payload.searchmoves
     end
 
-    local response = requestFunction({
-        Url = CHESS_API_URL,
-        Method = "POST",
-        Headers = {
-            ["Content-Type"] = "application/json",
-        },
-        Body = HttpService:JSONEncode(apiPayload),
-    })
+    acquireApiSlot()
+
+    local okRequest, response = pcall(function()
+        return requestFunction({
+            Url = CHESS_API_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+            },
+            Body = HttpService:JSONEncode(apiPayload),
+            Timeout = API_REQUEST_TIMEOUT,
+        })
+    end)
+
+    releaseApiSlot()
+
+    if not okRequest then
+        error("HTTP request failed: " .. tostring(response))
+    end
 
     if not response then
         error("No response from chess-api.com")
     end
 
-    local statusCode =
-        tonumber(response.StatusCode or response.Status or 0) or 0
+    local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
 
-    if statusCode ~= 0
-        and (statusCode < 200 or statusCode >= 300) then
-
+    if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
+        local body = response.Body or response.body or ""
         error(
-            "Chess API HTTP error: "
-                .. tostring(statusCode)
-                .. " "
-                .. tostring(response.StatusMessage or "")
+            "Chess API HTTP " .. tostring(statusCode)
+                .. ": " .. tostring(response.StatusMessage or body)
         )
     end
 
     local body = response.Body or response.body
-
     if type(body) ~= "string" then
         error("Chess API returned no body")
     end
 
-    local ok, decoded =
-        pcall(HttpService.JSONDecode, HttpService, body)
-
-    if not ok or type(decoded) ~= "table" then
+    local okDecode, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+    if not okDecode or type(decoded) ~= "table" then
         error("Invalid JSON from chess-api.com")
     end
 
-    if decoded.error then
-        error(tostring(decoded.error))
+    if decoded.type == "info" and not decoded.move then
+        error(tostring(decoded.text or decoded.error or "Chess API returned an info/error response"))
+    end
+
+    if decoded.type == "error" or decoded.error then
+        error(tostring(decoded.error or decoded.text or "Chess API error"))
     end
 
     return decoded
@@ -552,32 +632,20 @@ local function apiResultToCp(result)
 
     if result.mate ~= nil then
         local mate = tonumber(result.mate)
-
         if mate then
             if mate > 0 then
-                return 100000
-                    - math.min(
-                        50000,
-                        math.max(0, mate - 1) * 100
-                    )
+                return 100000 - math.min(50000, math.max(0, mate - 1) * 100)
             end
-
-            return -100000
-                + math.min(
-                    50000,
-                    math.max(0, -mate - 1) * 100
-                )
+            return -100000 + math.min(50000, math.max(0, -mate - 1) * 100)
         end
     end
 
     local centipawns = tonumber(result.centipawns)
-
     if centipawns then
         return centipawns
     end
 
     local eval = tonumber(result.eval)
-
     if eval then
         return eval * 100
     end
@@ -656,21 +724,17 @@ local function analyzePosition(board)
     })
 
     local uciMove = result.move or result.lan
-
     if type(uciMove) ~= "string" or uciMove == "" then
         return fallbackAnalysis(board)
     end
 
-    local piece, move, fromNotation, toNotation =
-        mapEngineMove(board, uciMove)
-
+    local piece, move, fromNotation, toNotation = mapEngineMove(board, uciMove)
     if not piece or not move then
         return fallbackAnalysis(board)
     end
 
     local score
     local scoreType
-
     if result.mate ~= nil and tonumber(result.mate) then
         score = tonumber(result.mate)
         scoreType = "mate"
@@ -679,8 +743,7 @@ local function analyzePosition(board)
         scoreType = "eval"
     end
 
-    local pv
-
+    local pv = nil
     if type(result.continuationArr) == "table" then
         pv = table.concat(result.continuationArr, " ")
     end
@@ -688,19 +751,14 @@ local function analyzePosition(board)
     return {
         piece = piece,
         moveInfo = move,
-
         from = fromNotation,
         to = toNotation,
-
         uci = uciMove,
-
         score = score,
         scoreType = scoreType,
-
         depth = result.depth,
         pv = pv,
         nps = result.nps,
-
         timeMs = tonumber(result.time),
     }
 end
@@ -715,7 +773,7 @@ local function scoreToCp(scoreType, score)
     end
 
     if scoreType == "eval" then
-    return score * 100
+        return score * 100
     end
 
     if scoreType == "mate" then
@@ -883,7 +941,7 @@ gui.Parent = PlayerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(350, 285)
+main.Size = UDim2.fromOffset(350, 325)
 main.Position = UDim2.new(config.XScale, config.XOffset, config.YScale, config.YOffset)
 main.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
 main.BorderSizePixel = 0
@@ -1030,17 +1088,24 @@ autoRankedToggle = makeToggle(138, "Auto Ranked Loop", state.AutoRanked, functio
     saveConfig()
 end)
 
-local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 176), UDim2.fromOffset(318, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
+local gpuOptimizationToggle = makeToggle(176, "Unfocused GPU Optimization", state.GPUOptimization, function(enabled)
+    state.GPUOptimization = enabled
+    config.GPUOptimization = enabled
+    setGPUOptimization(enabled)
+    saveConfig()
+end)
+
+local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 214), UDim2.fromOffset(318, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
 bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 198), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
+local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 236), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 220), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 258), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
 
-local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 267), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
+local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 305), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
 menuKeyButton.Size = UDim2.fromOffset(120, 22)
-menuKeyButton.Position = UDim2.fromOffset(214, 264)
+menuKeyButton.Position = UDim2.fromOffset(214, 302)
 menuKeyButton.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
 menuKeyButton.BorderSizePixel = 0
 menuKeyButton.AutoButtonColor = false
@@ -1049,6 +1114,11 @@ menuKeyButton.TextSize = 9
 menuKeyButton.TextColor3 = Color3.fromRGB(235, 238, 245)
 menuKeyButton.Text = state.MenuKeyCode.Name
 menuKeyButton.Parent = main
+
+if state.GPUOptimization then
+    enableGPUOptimization()
+end
+
 local keyCorner = Instance.new("UICorner")
 keyCorner.CornerRadius = UDim.new(0, 6)
 keyCorner.Parent = menuKeyButton
@@ -1167,12 +1237,16 @@ local function updateAnalysisUI(recommendation)
         "Depth %s  •  %.1fs  •  %s",
         tostring(recommendation.depth or "?"),
         (tonumber(recommendation.timeMs) or math.floor(state.EngineSeconds * 1000)) / 1000,
-        recommendation.nps and (tostring(recommendation.nps) .. " NPS") or "Stockfish"
+        recommendation.nps and (tostring(recommendation.nps) .. " NPS") or "Stockfish 18 API"
     )
 end
 
 local function analyzeCurrent(board)
     if state.Busy or not board or not isPlayerTurn(board) then
+        return nil
+    end
+
+    if os.clock() < state.EngineRetryAt then
         return nil
     end
 
@@ -1188,9 +1262,17 @@ local function analyzeCurrent(board)
     state.Busy = false
 
     if not ok or not result then
-        searchStatusLabel.Text = "Engine analysis failed"
+        state.EngineRetryAt = os.clock() + 1.5
+        local reason = tostring(result or "unknown error")
+        reason = reason:gsub("\n", " ")
+        if #reason > 90 then
+            reason = string.sub(reason, 1, 90) .. "..."
+        end
+        searchStatusLabel.Text = "Engine failed: " .. reason
         return nil
     end
+
+    state.EngineRetryAt = 0
 
     -- Keep the completed analysis visible even if the opponent moved while
     -- Stockfish was thinking. It is display-only once its original position
@@ -1239,120 +1321,29 @@ local function playRecommendation(recommendation)
     return ok
 end
 
-local function findRankedButton()
-    local menuGui = PlayerGui:FindFirstChild("menu")
-    if not menuGui then
-        return nil
-    end
+local function getMatchfinding()
+    local ok, module = pcall(function()
+        return require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
+    end)
 
-    local frame = menuGui:FindFirstChild("Frame")
-    local ranked = frame and frame:FindFirstChild("Ranked")
-    local rankedFrame = ranked and ranked:FindFirstChild("Frame")
-    local button = rankedFrame and rankedFrame:FindFirstChild("button")
-
-    if button and button:IsA("GuiButton") then
-        return button
+    if ok and type(module) == "table" then
+        return module
     end
 
     return nil
 end
 
-local function getServerList(cursor)
-    local url = string.format(
-        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=%d%s",
-        tostring(game.PlaceId),
-        SERVER_LIST_LIMIT,
-        cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
-    )
+local function waitForQueueState(matchfinding, desired, timeout)
+    local deadline = os.clock() + timeout
 
-    local ok, raw = pcall(function()
-        if type(requestFunction) == "function" then
-            local response = requestFunction({
-                Url = url,
-                Method = "GET",
-            })
-            if not response then
-                error("No response from Roblox server list")
-            end
-            local body = response.Body or response.body
-            if type(body) ~= "string" then
-                error("Invalid server-list response")
-            end
-            return body
+    while os.clock() < deadline do
+        if matchfinding.inque == desired then
+            return true
         end
-        return game:HttpGet(url)
-    end)
-
-    if not ok then
-        return nil
+        task.wait(0.05)
     end
 
-    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not decodedOk or type(data) ~= "table" then
-        return nil
-    end
-
-    return data
-end
-
-local function findMostPopulatedServer()
-    local currentJobId = tostring(game.JobId)
-    local best = nil
-    local cursor = nil
-
-    for _ = 1, SERVER_SCAN_PAGES do
-        local page = getServerList(cursor)
-        if not page then
-            break
-        end
-
-        for _, server in ipairs(page.data or {}) do
-            local id = tostring(server.id or "")
-            local playing = tonumber(server.playing) or 0
-            local maxPlayers = tonumber(server.maxPlayers) or 0
-
-            if id ~= ""
-                and id ~= currentJobId
-                and maxPlayers > 0
-                and playing < maxPlayers then
-                if not best or playing > best.playing then
-                    best = {
-                        id = id,
-                        playing = playing,
-                        maxPlayers = maxPlayers,
-                    }
-                end
-            end
-        end
-
-        cursor = page.nextPageCursor
-        if not cursor or cursor == "null" then
-            break
-        end
-
-        task.wait(0.15)
-    end
-
-    return best
-end
-
-local function hopToMostPopulatedServer()
-    local target = findMostPopulatedServer()
-    if not target then
-        return false
-    end
-
-    task.wait(SERVER_HOP_DELAY)
-
-    local ok = pcall(function()
-        TeleportService:TeleportToPlaceInstance(
-            game.PlaceId,
-            target.id,
-            LocalPlayer
-        )
-    end)
-
-    return ok
+    return matchfinding.inque == desired
 end
 
 local function queueRanked()
@@ -1365,49 +1356,59 @@ local function queueRanked()
         return false
     end
 
-    local button = findRankedButton()
-    if not button or not button.Visible then
-        return false
-    end
-
-    local matchfinding = nil
-    pcall(function()
-        matchfinding = require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
-    end)
-
-    if matchfinding and matchfinding.inque then
-        return false
-    end
-
     if os.clock() < state.NextRankedAttempt then
         return false
     end
 
-    state.AutoRankedBusy = true
-    state.NextRankedAttempt = os.clock() + 5
-
-    local fired = false
-
-    if type(firesignal) == "function" then
-        local ok = pcall(firesignal, button.Activated)
-        fired = ok
-    elseif type(getconnections) == "function" then
-        local ok, connections = pcall(getconnections, button.Activated)
-        if ok and type(connections) == "table" then
-            for _, connection in ipairs(connections) do
-                if type(connection.Fire) == "function" then
-                    pcall(connection.Fire, connection)
-                    fired = true
-                end
-            end
-        end
+    local matchfinding = getMatchfinding()
+    if not matchfinding then
+        return false
     end
 
-    task.delay(0.35, function()
+    -- After a finished match the game's queue state can remain marked as
+    -- active even though the old match is gone. Reset that state once before
+    -- starting the next queue cycle. This is the state that a server hop was
+    -- previously resetting for us.
+    if matchfinding.inque and state.NeedsFreshQueue then
+        state.AutoRankedBusy = true
+        state.NextRankedAttempt = os.clock() + 1.5
+
+        pcall(function()
+            matchfinding:leave()
+        end)
+
+        waitForQueueState(matchfinding, false, 3)
+        task.wait(0.25)
+
         state.AutoRankedBusy = false
+
+        if matchfinding.inque then
+            return false
+        end
+    elseif matchfinding.inque then
+        -- A fresh queue is already active. Do not cancel it on every loop.
+        return true
+    end
+
+    state.AutoRankedBusy = true
+    state.NextRankedAttempt = os.clock() + 2
+
+    local ok = pcall(function()
+        matchfinding:toggleque()
     end)
 
-    return fired
+    if ok then
+        state.QueueStartedAt = os.clock()
+        state.NeedsFreshQueue = false
+    end
+
+    task.delay(0.5, function()
+        if not state.Destroyed then
+            state.AutoRankedBusy = false
+        end
+    end)
+
+    return ok
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
@@ -1420,6 +1421,7 @@ EndGame.OnClientEvent:Connect(function(matchId)
     end
 
     state.AutoRankedBusy = true
+    state.NeedsFreshQueue = true
 
     task.spawn(function()
         task.wait(0.35)
@@ -1456,25 +1458,9 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.PendingPlayKey = nil
         state.NextRankedAttempt = os.clock() + 1
 
-        -- A fresh server resets matchmaking state (including a possibly stale
-        -- matchfinding.inque flag), which avoids getting stuck in the ranked queue.
-        if state.AutoRanked then
-            task.spawn(function()
-                hopToMostPopulatedServer()
-            end)
-            return
-        end
-
-        task.wait(1)
+        task.wait(0.5)
         state.AutoRankedBusy = false
     end)
-end)
-
-TeleportService.TeleportInitFailed:Connect(function()
-    if state.AutoRanked and not state.Destroyed then
-        state.AutoRankedBusy = false
-        state.NextRankedAttempt = os.clock() + 2
-    end
 end)
 
 state.Destroy = function()
@@ -1483,13 +1469,12 @@ state.Destroy = function()
     end
 
     state.Destroyed = true
+    state.Enabled = false
+    state.AutoRanked = false
+    disableGPUOptimization()
+    saveConfig()
 
-    -- Do NOT change persistent settings here.
-    -- This function is only used to shut down an old script instance.
-
-    pcall(function()
-        gui:Destroy()
-    end)
+    pcall(function() gui:Destroy() end)
 end
 
 local onlyStartedOutput = true
@@ -1541,25 +1526,41 @@ task.spawn(function()
                     local playedMove = move.from .. "-" .. move.to
 
                     task.spawn(function()
-                     local ok, result = pcall(function()
-    local bestResult = requestStockfish({
-        fen = previousFen,
-        depth = CHESS_API_DEPTH,
-        maxThinkingTime = apiThinkingMs(state.EngineSeconds),
-    })
+                        -- Give the live engine move request priority. Accuracy is
+                        -- display-only and should never compete with autoplay.
+                        task.wait(0.75)
 
-    local playedResult = requestStockfish({
-        fen = previousFen,
-        depth = CHESS_API_DEPTH,
-        maxThinkingTime = apiThinkingMs(state.AccuracySeconds),
-        searchmoves = move.uci,
-    })
+                        while not state.Destroyed do
+                            local liveBoard = MatchClient.currentMatch
+                            if not liveBoard or not isPlayerTurn(liveBoard) then
+                                break
+                            end
+                            task.wait(0.1)
+                        end
 
-    return {
-        best = bestResult,
-        played = playedResult,
-    }
-end)
+                        if state.Destroyed or generation ~= state.AccuracyGeneration then
+                            return
+                        end
+
+                        local ok, result = pcall(function()
+                            local bestResult = requestStockfish({
+                                fen = previousFen,
+                                depth = CHESS_API_DEPTH,
+                                maxThinkingTime = apiThinkingMs(state.EngineSeconds),
+                            })
+
+                            local playedResult = requestStockfish({
+                                fen = previousFen,
+                                depth = CHESS_API_DEPTH,
+                                maxThinkingTime = apiThinkingMs(state.AccuracySeconds),
+                                searchmoves = move.uci,
+                            })
+
+                            return {
+                                best = bestResult,
+                                played = playedResult,
+                            }
+                        end)
 
                         if state.Destroyed or generation ~= state.AccuracyGeneration then
                             return
@@ -1581,33 +1582,29 @@ end)
                         local accuracy
                         local cpl
 
-                     local bestResult = result.best
-local playedResult = result.played
+                        local bestResult = result.best
+                        local playedResult = result.played
+                        local bestMove = bestResult and (bestResult.move or bestResult.lan)
 
-local bestMove =
-    bestResult
-    and (bestResult.move or bestResult.lan)
+                        if bestMove == move.uci then
+                            accuracy = 100
+                            cpl = 0
+                        else
+                            local bestCp = apiResultToCp(bestResult)
+                            local playedCp = apiResultToCp(playedResult)
 
-if bestMove == move.uci then
-    accuracy = 100
-    cpl = 0
-else
-    local bestCp = apiResultToCp(bestResult)
-    local playedCp = apiResultToCp(playedResult)
+                            if bestCp ~= nil and playedCp ~= nil then
+                                -- chess-api.com reports eval/centipawns from White's POV.
+                                -- Convert the difference into loss from the mover's POV.
+                                if side == "White" then
+                                    cpl = math.max(0, bestCp - playedCp)
+                                else
+                                    cpl = math.max(0, playedCp - bestCp)
+                                end
 
-    if bestCp ~= nil and playedCp ~= nil then
-        -- chess-api.com reports evaluations from White's POV.
-        -- Convert the difference into loss for the player who moved.
-
-        if side == "White" then
-            cpl = math.max(0, bestCp - playedCp)
-        else
-            cpl = math.max(0, playedCp - bestCp)
-        end
-
-        accuracy = accuracyFromCpl(cpl)
-    end
-end
+                                accuracy = accuracyFromCpl(cpl)
+                            end
+                        end
 
                         if accuracy == nil then
                             if moveSerial >= state.LastAccuracyDisplayedSerial then
