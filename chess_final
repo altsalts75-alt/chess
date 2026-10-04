@@ -1,4 +1,5 @@
 --optional: put this script in your autoexec folder
+
 local env = getgenv()
 
 if env.__CHESS_TELEPORT_HANDOFF then
@@ -6,6 +7,28 @@ if env.__CHESS_TELEPORT_HANDOFF then
     return
 end
 
-loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/altsalts75-alt/chess/refs/heads/main/stockfish_online_api-obfuscated.lua"
-))()
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+
+repeat
+    task.wait(0.25)
+until Players.LocalPlayer
+
+local url = "https://raw.githubusercontent.com/altsalts75-alt/chess/refs/heads/main/stockfish_online_api-obfuscated.lua"
+
+local success, err = pcall(function()
+    local source = game:HttpGet(url)
+    assert(type(source) == "string" and #source > 0, "Downloaded script is empty")
+
+    local compiled, compileError = loadstring(source)
+    assert(compiled, compileError or "Compilation failed")
+
+    compiled()
+end)
+
+if not success then
+    warn("[Chess Launcher] Startup failed: " .. tostring(err))
+end
