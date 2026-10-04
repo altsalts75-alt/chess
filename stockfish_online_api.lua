@@ -4,11 +4,7 @@ local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 
--- Safe LocalPlayer (fixes the WaitForChild nil error)
 local LocalPlayer = Players.LocalPlayer
-if not LocalPlayer then
-    LocalPlayer = Players.PlayerAdded:Wait()
-end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- Anti-AFK
@@ -1363,9 +1359,6 @@ end
 
 local engineTitle = makeLabel(main, UDim2.fromOffset(16, 22), UDim2.fromOffset(170, 20), "ENGINE", 11, Color3.fromRGB(130, 138, 155))
 
--- Missing label that the update loop was trying to use
-local engineValue = makeLabel(main, UDim2.fromOffset(16, 36), UDim2.fromOffset(350, 16), "Stockfish 18 • 100ms", 12, Color3.fromRGB(235, 238, 245))
-
 task.spawn(function()
     while not state.Destroyed do
         if primaryApiOnCooldown() then
@@ -1373,6 +1366,7 @@ task.spawn(function()
         else
             engineValue.Text = "Stockfish 18 • 100ms"
         end
+
         task.wait(0.5)
     end
 end)
