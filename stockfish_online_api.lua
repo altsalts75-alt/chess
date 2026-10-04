@@ -216,7 +216,9 @@ local state = {
     NextRankedAttempt = 0,
     PendingPlayKey = nil,
     PendingAccuracy = nil,
-    LastOwnAnalysis = nil,
+    LastMoveUci = nil,
+    LastEngineFen = nil,
+    LastEngineResult = nil,
 }
 
 if state.AutoRanked then
@@ -358,24 +360,59 @@ local function boardPlacementToFen(board)
     return table.concat(ranks, "/")
 end
 
-local function enPassantSquare(board)
-    local activeTeam = board.activeTeam
+local function enPassantSquare(board, lastMoveUci)
+    if type(lastMoveUci) ~= "string" or #lastMoveUci < 4 then
+        return "-"
+    end
 
-    for x = 1, 8 do
-        for y = 1, 8 do
-            local pawn = board:getPiece({ x, y })
+    local fromFile = string.byte(string.sub(lastMoveUci, 1, 1)) - 96
+    local fromRank = tonumber(string.sub(lastMoveUci, 2, 2))
+    local toFile = string.byte(string.sub(lastMoveUci, 3, 3)) - 96
+    local toRank = tonumber(string.sub(lastMoveUci, 4, 4))
 
-            if pawn and pawn.Name == "Pawn"
-                and pawn.team ~= activeTeam
-                and pawn.position
-                and pawn.position.doublestep
-                and pawn.position.doublestep == board.round - 1 then
+    if not fromFile or not fromRank or not toFile or not toRank then
+        return "-"
+    end
 
-                local targetY = pawn.position[2] + (activeTeam == true and 1 or -1)
+    if fromFile ~= toFile or math.abs(toRank - fromRank) ~= 2 then
+        return "-"
+    end
 
-                if targetY >= 1 and targetY <= 8 then
-                    return squareToNotation({ pawn.position[1], targetY })
-                end
+    -- A white double-step (e2-e4) leaves e3 available to Black.
+    -- A black double-step (e7-e5) leaves e6 available to White.
+    if board.activeTeam == false then
+        if fromRank ~= 2 or toRank ~= 4 then
+            return "-"
+        end
+    else
+        if fromRank ~= 7 or toRank ~= 5 then
+            return "-"
+        end
+    end
+
+    local destination = board:getPiece({
+        9 - toFile,
+        toRank,
+    })
+
+    if not destination or destination.Name ~= "Pawn" or destination.team == board.activeTeam then
+        return "-"
+    end
+
+    -- Only advertise an EP target when the side to move actually has a pawn
+    -- capable of making that capture. This also avoids strict FEN validators
+    -- rejecting an otherwise harmless "ghost" en-passant square.
+    local captureRank = toRank
+    local leftX = toFile - 1
+    local rightX = toFile + 1
+
+    for _, x in ipairs({ leftX, rightX }) do
+        if x >= 1 and x <= 8 then
+            local pawn = board:getPiece({ 9 - x, captureRank })
+            if pawn
+                and pawn.Name == "Pawn"
+                and pawn.team == board.activeTeam then
+                return squareToNotation({ 9 - toFile, (fromRank + toRank) / 2 })
             end
         end
     end
@@ -415,10 +452,10 @@ local function castlingRights(board)
     return rights == "" and "-" or rights
 end
 
-local function boardToFen(board)
+local function boardToFen(board, lastMoveUci)
     local boardFen = boardPlacementToFen(board)
     local side = board.activeTeam == true and "w" or "b"
-    local ep = enPassantSquare(board)
+    local ep = enPassantSquare(board, lastMoveUci)
     local round = tonumber(board.round) or 0
     local fullmove = math.max(1, math.floor((round + 1) / 2))
 
@@ -434,33 +471,19 @@ end
 
 local apiRequestBusy = false
 local apiNextRequestAt = 0
-local apiEngineWaiting = 0
 
 local function requestStockfish(payload)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
     end
 
-    local priority = payload.priority == "accuracy" and "accuracy" or "engine"
-
-    if priority == "engine" then
-        apiEngineWaiting = apiEngineWaiting + 1
-    end
-
-    -- All engine/accuracy calls share one request lane. Engine requests have
-    -- priority so periodic accuracy analysis can never hold up autoplay.
-    while apiRequestBusy or (priority == "accuracy" and apiEngineWaiting > 0) do
+    -- All engine/accuracy calls share one request lane. This prevents
+    -- concurrent requests from overwhelming the public API.
+    while apiRequestBusy do
         if state.Destroyed then
-            if priority == "engine" then
-                apiEngineWaiting = math.max(0, apiEngineWaiting - 1)
-            end
             error("Script destroyed while waiting for API request")
         end
         task.wait(0.03)
-    end
-
-    if priority == "engine" then
-        apiEngineWaiting = math.max(0, apiEngineWaiting - 1)
     end
 
     apiRequestBusy = true
@@ -514,11 +537,19 @@ local function requestStockfish(payload)
         end
 
         if decoded.error then
-            error("Chess API error: " .. tostring(decoded.error))
+            local apiError = tostring(decoded.error)
+            if string.find(apiError, "FEN", 1, true) then
+                error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
+            end
+            error("Chess API error: " .. apiError)
         end
 
         if decoded.type == "error" then
-            error("Chess API error: " .. tostring(decoded.text or decoded.error or "unknown error"))
+            local apiError = tostring(decoded.text or decoded.error or "unknown error")
+            if string.find(apiError, "FEN", 1, true) or string.find(apiError, "FEN_VALIDATION", 1, true) then
+                error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
+            end
+            error("Chess API error: " .. apiError)
         end
 
         apiNextRequestAt = os.clock() + API_REQUEST_GAP
@@ -633,9 +664,9 @@ local function fallbackAnalysis(board)
     return nil
 end
 
-local function analyzePosition(board)
+local function analyzePosition(board, lastMoveUci)
     local result = requestStockfish({
-        fen = boardToFen(board),
+        fen = boardToFen(board, lastMoveUci),
     })
 
     local uciMove = result.move or result.lan
@@ -676,7 +707,6 @@ local function analyzePosition(board)
         pv = pv,
         nps = result.nps,
         timeMs = tonumber(result.time),
-        apiResult = result,
     }
 end
 
@@ -727,7 +757,7 @@ local function classifyAccuracy(accuracy)
     return "Blunder"
 end
 
-local function snapshotBoard(board)
+local function snapshotBoard(board, lastMoveUci)
     if not board then
         return nil
     end
@@ -750,7 +780,7 @@ local function snapshotBoard(board)
     return {
         board = board,
         activeTeam = board.activeTeam,
-        fen = boardToFen(board),
+        fen = boardToFen(board, lastMoveUci),
         squares = squares,
     }
 end
@@ -989,7 +1019,7 @@ bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 182), UDim2.fromOffset(318, 44), "Last sampled move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 182), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
 
 local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 238), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
@@ -1122,10 +1152,10 @@ local function analyzeCurrent(board)
     searchStatusLabel.Text = "Analyzing..."
 
     local generationKey = boardKey(board)
-    local positionFen = boardToFen(board)
+    local positionFen = boardToFen(board, state.LastMoveUci)
     local analysisSide = board.activeTeam and "White" or "Black"
     local ok, result = pcall(function()
-        return analyzePosition(board)
+        return analyzePosition(board, state.LastMoveUci)
     end)
     state.Busy = false
 
@@ -1145,6 +1175,12 @@ local function analyzeCurrent(board)
     result.positionFen = positionFen
     result.side = analysisSide
     result.board = board
+
+    -- Keep the engine result so sampled accuracy checks can reuse it when
+    -- the sampled move is the same position we just analyzed.
+    state.LastEngineFen = positionFen
+    state.LastEngineResult = result
+
     state.Recommendation = result
     updateAnalysisUI(result)
     return result
@@ -1174,6 +1210,9 @@ local function playRecommendation(recommendation)
 
     MovePiece:FireServer(board.id, { piece.position[1], piece.position[2] }, moveInfo, options)
 
+    -- Track the exact last move so the next FEN has correct en-passant state.
+    state.LastMoveUci = recommendation.uci
+
     -- Keep the local MatchClient board in sync immediately. The original
     -- game's own client does the same after sending a move. Without this,
     -- the server call can succeed while the local board never advances,
@@ -1181,20 +1220,6 @@ local function playRecommendation(recommendation)
     local ok = pcall(function()
         MatchClient:processRound(piece, moveInfo, options)
     end)
-
-    if ok then
-        -- Cache the exact engine result used for this position. If this move
-        -- is selected for periodic accuracy sampling, we already know the
-        -- engine's best move and evaluation and don't need another API call.
-        state.LastOwnAnalysis = {
-            generation = state.AccuracyGeneration,
-            fen = recommendation.positionFen,
-            uci = recommendation.uci,
-            apiResult = recommendation.apiResult,
-            side = recommendation.side,
-            playedMove = recommendation.from .. "-" .. recommendation.to,
-        }
-    end
 
     return ok
 end
@@ -1208,63 +1233,57 @@ local function processAccuracyJob(job)
         return
     end
 
-    -- If this was one of our own engine-selected moves, the engine result
-    -- used to choose it is already cached. That means no second "best move"
-    -- request is necessary.
-    local bestResult = job.bestResult
+    local bestResult
+
+    if job.fen == state.LastEngineFen and type(state.LastEngineResult) == "table" then
+        bestResult = state.LastEngineResult
+    end
+
+    local bestOk = true
 
     if not bestResult then
-        local bestOk, fetchedBest = pcall(function()
+        bestOk, bestResult = pcall(function()
             return requestStockfish({
                 fen = job.fen,
-                priority = "accuracy",
             })
         end)
+    end
 
-        if not bestOk or not fetchedBest then
-            accuracyLabel.Text = string.format(
-                "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-                job.side,
-                job.playedMove,
-                state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-            )
-            return
-        end
+    if not bestOk or not bestResult then
+        accuracyLabel.Text = string.format(
+            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
+            job.side,
+            job.playedMove,
+            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
+        )
+        return
+    end
 
-        bestResult = fetchedBest
+    local playedOk, playedResult = pcall(function()
+        return requestStockfish({
+            fen = job.fen,
+            searchmoves = job.uci,
+        })
+    end)
+
+    if not playedOk or not playedResult then
+        accuracyLabel.Text = string.format(
+            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
+            job.side,
+            job.playedMove,
+            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
+        )
+        return
     end
 
     local bestMove = bestResult.move or bestResult.lan
     local accuracy
     local cpl
 
-    -- If the sampled move is already the engine's best move, it is 100%
-    -- accurate and we do not need a second API request.
     if bestMove == job.uci then
         accuracy = 100
         cpl = 0
     else
-        -- Only the played-move evaluation is needed now. This is the main
-        -- API-usage reduction: the best-position request is reused whenever
-        -- we already analyzed that position.
-        local playedOk, playedResult = pcall(function()
-            return requestStockfish({
-                fen = job.fen,
-                searchmoves = job.uci,
-                priority = "accuracy",
-            })
-        end)
-
-        if not playedOk or not playedResult then
-            accuracyLabel.Text = string.format(
-                "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-                job.side,
-                job.playedMove,
-                state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-            )
-            return
-        end
-
         local bestCp = apiResultToCp(bestResult)
         local playedCp = apiResultToCp(playedResult)
 
@@ -1274,7 +1293,6 @@ local function processAccuracyJob(job)
             else
                 cpl = math.max(0, playedCp - bestCp)
             end
-
             accuracy = accuracyFromCpl(cpl)
         end
     end
@@ -1300,7 +1318,7 @@ local function processAccuracyJob(job)
     local classification = classifyAccuracy(accuracy)
 
     accuracyLabel.Text = string.format(
-        "Last sampled move: %s %s • %.0f%% %s • %d CPL\nGame accuracy: %.0f%%",
+        "Last move: %s %s • %.0f%% %s • %d CPL\nGame accuracy: %.0f%%",
         job.side,
         job.playedMove,
         accuracy,
@@ -1525,7 +1543,9 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.CurrentGameId = nil
         state.PendingPlayKey = nil
         state.PendingAccuracy = nil
-        state.LastOwnAnalysis = nil
+        state.LastMoveUci = nil
+        state.LastEngineFen = nil
+        state.LastEngineResult = nil
         state.NextRankedAttempt = os.clock() + 1
 
         if state.AutoRanked then
@@ -1570,7 +1590,7 @@ task.spawn(function()
         local currentMatch = MatchClient.currentMatch
         local gameId = currentMatch and tostring(currentMatch.id) or nil
         local key = currentMatch and boardKey(currentMatch) or nil
-        local snapshot = currentMatch and snapshotBoard(currentMatch) or nil
+        local snapshot = currentMatch and snapshotBoard(currentMatch, state.LastMoveUci) or nil
 
         -- Reset only when the actual match changes. Do NOT use boardKey here
         -- because boardKey changes after every move (round/side-to-move).
@@ -1586,7 +1606,9 @@ task.spawn(function()
             state.LastBoardKey = key
             state.PendingPlayKey = nil
             state.PendingAccuracy = nil
-            state.LastOwnAnalysis = nil
+            state.LastMoveUci = nil
+            state.LastEngineFen = nil
+            state.LastEngineResult = nil
 
             if not gameId then
                 accuracyLabel.Text = "Last move: --\nGame accuracy: --"
@@ -1594,8 +1616,8 @@ task.spawn(function()
         end
 
         -- Detect the move BEFORE replacing LastSnapshot.
-        -- Accuracy is sampled on every second game move to reduce API usage.
-        -- Only the sampled moves create an accuracy job.
+        -- Accuracy jobs are stored and processed serially so they can never
+        -- compete with the next move-analysis request.
         if currentMatch and snapshot and state.LastSnapshot and gameId == state.CurrentGameId then
             local previousSnapshot = state.LastSnapshot
 
@@ -1603,39 +1625,21 @@ task.spawn(function()
                 local move = detectMove(previousSnapshot, snapshot)
 
                 if move then
+                    state.LastMoveUci = move.uci
+                    snapshot.fen = boardToFen(currentMatch, state.LastMoveUci)
+
                     state.AccuracyMoveSerial = state.AccuracyMoveSerial + 1
 
+                    -- Analyze accuracy on every 2nd ply only. This substantially
+                    -- reduces API usage while leaving every actual bot move at
+                    -- the full depth/time limit.
                     if state.AccuracyMoveSerial % 2 == 0 then
-                        local bestResult = nil
-
-                        -- If the sampled move was made by us and matches the
-                        -- exact position/move we just analyzed, reuse that API
-                        -- result instead of requesting the best move again.
-                        local previousBoard = previousSnapshot.board
-                        local localMover =
-                            previousBoard
-                            and previousBoard.players
-                            and previousBoard.players[previousSnapshot.activeTeam]
-                            == LocalPlayer
-
-                        local cached = state.LastOwnAnalysis
-
-                        if localMover
-                            and cached
-                            and cached.generation == state.AccuracyGeneration
-                            and cached.fen == previousSnapshot.fen
-                            and cached.uci == move.uci then
-
-                            bestResult = cached.apiResult
-                        end
-
                         state.PendingAccuracy = {
                             generation = state.AccuracyGeneration,
                             fen = previousSnapshot.fen,
                             uci = move.uci,
                             side = move.side,
                             playedMove = move.from .. "-" .. move.to,
-                            bestResult = bestResult,
                         }
                     end
                 end
