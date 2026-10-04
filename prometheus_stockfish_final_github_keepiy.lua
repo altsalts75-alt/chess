@@ -143,9 +143,30 @@ loadConfig()
 -- Keep the toggle in the executor environment too. This survives a
 -- teleport re-execution even when the workspace config is not yet available.
 local runtimeConfig = executorEnv.__CHESS_CONFIG
+
 if type(runtimeConfig) == "table" then
+    if type(runtimeConfig.EngineSeconds) == "number" then
+        config.EngineSeconds = math.clamp(runtimeConfig.EngineSeconds, 0.5, 30)
+    end
+
+    if type(runtimeConfig.AccuracySeconds) == "number" then
+        config.AccuracySeconds = math.clamp(runtimeConfig.AccuracySeconds, 0.2, 10)
+    end
+
+    if type(runtimeConfig.AutoPlay) == "boolean" then
+        config.AutoPlay = runtimeConfig.AutoPlay
+    end
+
     if type(runtimeConfig.AutoRanked) == "boolean" then
         config.AutoRanked = runtimeConfig.AutoRanked
+    end
+
+    if type(runtimeConfig.MenuKeyCode) == "string" then
+        local enumValue = Enum.KeyCode[runtimeConfig.MenuKeyCode]
+
+        if enumValue then
+            config.MenuKeyCode = runtimeConfig.MenuKeyCode
+        end
     end
 end
 
