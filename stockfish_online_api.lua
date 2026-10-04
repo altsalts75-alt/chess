@@ -32,19 +32,19 @@ local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("C
 local CHESS_API_URL = "https://chess-api.com/v1"
 local CHESS_API_DEPTH = 18
 local CHESS_API_MAX_THINKING_MS = 100
--- chess-api.com does not publish a numeric HIGH_USAGE quota. Keep a strict
--- total request budget anyway, and make the budget persist across teleports.
-local API_NORMAL_REQUEST_GAP = 4.0
-local API_NORMAL_MAX_REQUESTS_PER_MINUTE = 30
-local API_RECOVERY_REQUEST_GAP = 6.0
-local API_RECOVERY_MAX_REQUESTS_PER_MINUTE = 15
-local API_RECOVERY_DEPTH = 12
-local API_RECOVERY_MAX_THINKING_MS = 50
-local API_FAILURE_BACKOFF = 6.0
-local API_HIGH_USAGE_COOLDOWN = 30
-local API_RECOVERY_MODE_DURATION = 180
+
+-- chess-api.com does not publish a numeric HIGH_USAGE quota. We do not try
+-- to defeat that server-side control. Instead, when it throttles us, the
+-- script temporarily stops sending requests to chess-api.com and switches to
+-- a second, independent Stockfish service.
+local STOCKFISH_ONLINE_URL = "https://stockfish.online/api/s/v2.php"
+local STOCKFISH_ONLINE_DEPTH = 15 -- current public maximum is below 16
+
+local API_REQUEST_GAP = 3.5
+local API_MAX_REQUESTS_PER_MINUTE = 20
+local API_FAILURE_BACKOFF = 5.0
+local API_PRIMARY_COOLDOWN = 300
 local API_ACCURACY_SAMPLE_EVERY = 3
-local API_ENGINE_RETRY_COUNT = 1
 local API_CACHE_TTL = 600
 local API_CACHE_MAX_ENTRIES = 300
 local CONFIG_FILE = "prometheus_stockfish_config.json"
@@ -63,20 +63,22 @@ local AutoPlayState = executorEnv
 -- Persist API usage state/cache through teleports. This reduces repeated
 -- opening-position requests and prevents a fresh script instance from
 -- immediately resetting the usage limiter.
-local sharedApi = executorEnv.__CHESS_API_STATE_V3
+local sharedApi = executorEnv.__CHESS_API_STATE_V4
 if type(sharedApi) ~= "table" then
     sharedApi = {
         RequestTimes = {},
         Cache = {},
         NextRequestAt = 0,
+        PrimaryCooldownUntil = 0,
         HighUsageUntil = 0,
         RecoveryUntil = 0,
     }
-    executorEnv.__CHESS_API_STATE_V3 = sharedApi
+    executorEnv.__CHESS_API_STATE_V4 = sharedApi
 end
 sharedApi.RequestTimes = type(sharedApi.RequestTimes) == "table" and sharedApi.RequestTimes or {}
 sharedApi.Cache = type(sharedApi.Cache) == "table" and sharedApi.Cache or {}
 sharedApi.NextRequestAt = tonumber(sharedApi.NextRequestAt) or 0
+sharedApi.PrimaryCooldownUntil = tonumber(sharedApi.PrimaryCooldownUntil) or 0
 sharedApi.HighUsageUntil = tonumber(sharedApi.HighUsageUntil) or 0
 sharedApi.RecoveryUntil = tonumber(sharedApi.RecoveryUntil) or 0
 
@@ -284,7 +286,7 @@ local state = {
 
     -- Public API protection. These are runtime-only and never saved to the
     -- user's config, so Auto Ranked ON/OFF is unaffected.
-    ApiHighUsageUntil = sharedApi.HighUsageUntil,
+    ApiHighUsageUntil = sharedApi.PrimaryCooldownUntil,
     ApiRequestTimes = sharedApi.RequestTimes,
 
     -- Ranked-cycle runtime guards. These do not alter the saved AutoRanked
@@ -577,11 +579,7 @@ local function isAccuracySampleForSide(side, nextCount)
 end
 
 local function apiProfile()
-    if apiNow() < sharedApi.RecoveryUntil then
-        return API_RECOVERY_REQUEST_GAP, API_RECOVERY_MAX_REQUESTS_PER_MINUTE,
-            API_RECOVERY_DEPTH, API_RECOVERY_MAX_THINKING_MS
-    end
-    return API_NORMAL_REQUEST_GAP, API_NORMAL_MAX_REQUESTS_PER_MINUTE,
+    return API_REQUEST_GAP, API_MAX_REQUESTS_PER_MINUTE,
         CHESS_API_DEPTH, CHESS_API_MAX_THINKING_MS
 end
 
@@ -642,10 +640,146 @@ end
 
 local function markHighUsage()
     local now = apiNow()
-    sharedApi.HighUsageUntil = math.max(sharedApi.HighUsageUntil, now + API_HIGH_USAGE_COOLDOWN)
-    sharedApi.RecoveryUntil = math.max(sharedApi.RecoveryUntil, now + API_RECOVERY_MODE_DURATION)
-    sharedApi.NextRequestAt = math.max(sharedApi.NextRequestAt, now + API_RECOVERY_REQUEST_GAP)
-    state.ApiHighUsageUntil = sharedApi.HighUsageUntil
+    sharedApi.PrimaryCooldownUntil = math.max(
+        tonumber(sharedApi.PrimaryCooldownUntil) or 0,
+        now + API_PRIMARY_COOLDOWN
+    )
+    sharedApi.HighUsageUntil = sharedApi.PrimaryCooldownUntil
+    state.ApiHighUsageUntil = sharedApi.PrimaryCooldownUntil
+end
+
+local function requestStockfishOnline(payload, laneAlreadyHeld)
+    if type(requestFunction) ~= "function" then
+        error("No executor HTTP request function is available")
+    end
+
+    local depth = STOCKFISH_ONLINE_DEPTH
+    local key = apiCacheKey(payload, depth, 0)
+    local cached = getCachedApiResult(key)
+    if cached then
+        return cached
+    end
+
+    if not laneAlreadyHeld then
+        while apiRequestBusy do
+            if state.Destroyed then
+                error("Script destroyed while waiting for API request")
+            end
+            task.wait(0.03)
+        end
+
+        apiRequestBusy = true
+    end
+
+    local ok, result = xpcall(function()
+        while true do
+            local tnow = apiNow()
+            local times = pruneApiRequestTimes(tnow)
+            local waitFor = sharedApi.NextRequestAt - tnow
+            if #times < API_MAX_REQUESTS_PER_MINUTE and waitFor <= 0 then
+                break
+            end
+
+            local budgetWait = #times >= API_MAX_REQUESTS_PER_MINUTE
+                and math.max(0, (times[1] or tnow) + 60 - tnow)
+                or 0
+            local targetWait = math.max(waitFor, budgetWait)
+            if targetWait > 0 then
+                task.wait(math.min(targetWait, 1.0))
+            else
+                task.wait(0.03)
+            end
+        end
+
+        local lateCached = getCachedApiResult(key)
+        if lateCached then
+            return lateCached
+        end
+
+        local requestNow = apiNow()
+        local finalTimes = pruneApiRequestTimes(requestNow)
+        if #finalTimes >= API_MAX_REQUESTS_PER_MINUTE then
+            error("API_LOCAL_RATE_LIMIT")
+        end
+
+        local encodedFen = HttpService:UrlEncode(tostring(payload.fen or ""))
+        local url = STOCKFISH_ONLINE_URL
+            .. "?fen=" .. encodedFen
+            .. "&depth=" .. tostring(depth)
+
+        table.insert(sharedApi.RequestTimes, apiNow())
+        state.ApiRequestTimes = sharedApi.RequestTimes
+        sharedApi.NextRequestAt = apiNow() + API_REQUEST_GAP
+
+        local response = requestFunction({
+            Url = url,
+            Method = "GET",
+        })
+
+        if not response then
+            error("No response from stockfish.online")
+        end
+
+        local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
+        local responseBody = response.Body or response.body or ""
+        if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
+            error("StockfishOnline HTTP " .. tostring(statusCode))
+        end
+        if type(responseBody) ~= "string" then
+            error("StockfishOnline returned no body")
+        end
+
+        local decodeOk, decoded = pcall(HttpService.JSONDecode, HttpService, responseBody)
+        if not decodeOk or type(decoded) ~= "table" then
+            error("Invalid JSON from stockfish.online")
+        end
+
+        if decoded.success ~= true then
+            error(tostring(decoded.data or decoded.error or "StockfishOnline analysis failed"))
+        end
+
+        local bestmoveText = tostring(decoded.bestmove or "")
+        local uciMove = string.match(bestmoveText, "bestmove%s+([a-h][1-8][a-h][1-8][qrbn]?)")
+        if not uciMove then
+            uciMove = string.match(bestmoveText, "([a-h][1-8][a-h][1-8][qrbn]?)")
+        end
+        if not uciMove then
+            error("StockfishOnline returned no legal move")
+        end
+
+        local evaluation = tonumber(decoded.evaluation)
+        local normalized = {
+            type = "bestmove",
+            move = uciMove,
+            lan = uciMove,
+            eval = evaluation,
+            centipawns = evaluation and (evaluation * 100) or nil,
+            mate = decoded.mate,
+            continuationArr = {},
+            depth = depth,
+            provider = "StockfishOnline",
+        }
+
+        if type(decoded.continuation) == "string" then
+            for move in string.gmatch(decoded.continuation, "%S+") do
+                table.insert(normalized.continuationArr, move)
+            end
+        end
+
+        storeCachedApiResult(key, normalized)
+        return normalized
+    end, debug.traceback)
+
+    if not laneAlreadyHeld then
+        apiRequestBusy = false
+    end
+    state.ApiRequestTimes = sharedApi.RequestTimes
+
+    if not ok then
+        error(result)
+    end
+
+    return result
 end
 
 local function requestStockfish(payload)
@@ -656,13 +790,11 @@ local function requestStockfish(payload)
     local requestKind = payload.kind == "accuracy" and "accuracy" or "engine"
     local now = apiNow()
 
-    -- Accuracy is optional. During a usage event/recovery period, drop it
-    -- completely so the engine move requests are the only traffic sent.
-    if requestKind == "accuracy" and (
-        now < sharedApi.HighUsageUntil
-        or now < sharedApi.RecoveryUntil
-    ) then
-        error("ACCURACY_COOLDOWN")
+    -- If chess-api.com has recently returned HIGH_USAGE, do not probe it again
+    -- for several minutes. Use the independent provider instead. This is a
+    -- failover, not an attempt to bypass the server-side restriction.
+    if now < (tonumber(sharedApi.PrimaryCooldownUntil) or 0) then
+        return requestStockfishOnline(payload)
     end
 
     local gap, maxPerMinute, depth, thinkingMs = apiProfile()
@@ -755,7 +887,7 @@ local function requestStockfish(payload)
 
         if statusCode == 429 or isHighUsageText(responseBody) then
             markHighUsage()
-            error("HIGH_USAGE")
+            return requestStockfishOnline(payload, true)
         end
 
         if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
@@ -778,7 +910,7 @@ local function requestStockfish(payload)
             local apiError = tostring(decoded.error)
             if isHighUsageText(apiError) then
                 markHighUsage()
-                error("HIGH_USAGE")
+                return requestStockfishOnline(payload, true)
             end
             if string.find(apiError, "FEN", 1, true) then
                 error("Chess API FEN error: " .. apiError .. " | FEN=" .. tostring(apiPayload.fen))
@@ -790,7 +922,7 @@ local function requestStockfish(payload)
             local apiError = tostring(decoded.text or decoded.error or "unknown error")
             if isHighUsageText(apiError) then
                 markHighUsage()
-                error("HIGH_USAGE")
+                return requestStockfishOnline(payload, true)
             end
             if string.find(apiError, "FEN", 1, true)
                 or string.find(apiError, "FEN_VALIDATION", 1, true) then
@@ -807,11 +939,6 @@ local function requestStockfish(payload)
         local message = tostring(result)
         if isHighUsageText(message) then
             markHighUsage()
-            -- Keep the next attempt well away from this rejection.
-            sharedApi.NextRequestAt = math.max(
-                sharedApi.NextRequestAt,
-                apiNow() + API_RECOVERY_REQUEST_GAP
-            )
         else
             sharedApi.NextRequestAt = math.max(
                 sharedApi.NextRequestAt,
@@ -1455,7 +1582,8 @@ local function updateAnalysisUI(recommendation)
         "Depth %s  •  %sms max  •  %s",
         tostring(recommendation.depth or "?"),
         tostring(displayThinking),
-        recommendation.nps and (tostring(recommendation.nps) .. " NPS") or "Stockfish 18"
+        recommendation.nps and (tostring(recommendation.nps) .. " NPS")
+            or (recommendation.provider or "Stockfish 18")
     )
 end
 
@@ -1477,39 +1605,15 @@ local function analyzeCurrent(board)
 
     if not ok or not result then
         local reason = tostring(result or "unknown error")
-
-        -- A HIGH_USAGE response should not immediately force a random/local
-        -- fallback move. The API layer has already switched to its recovery
-        -- profile (slower spacing + depth 12/50 ms), so give that profile one
-        -- controlled retry for the actual engine move. Accuracy requests never
-        -- get this retry because they are optional.
         if isHighUsageText(reason) then
-            for _ = 1, API_ENGINE_RETRY_COUNT do
-                if state.Destroyed then
-                    return nil
-                end
-                searchStatusLabel.Text = "API recovering..."
-                local retryOk, retryResult = pcall(function()
-                    return analyzePosition(board, state.LastMoveUci)
-                end)
-                if retryOk and retryResult then
-                    ok = true
-                    result = retryResult
-                    break
-                end
-                reason = tostring(retryResult or reason)
-            end
+            reason = "Primary API throttled"
         end
-
-        if not ok or not result then
-            if #reason > 52 then
-                reason = string.sub(reason, 1, 52) .. "..."
-            end
-            searchStatusLabel.Text = "Engine unavailable: " .. reason
-            return nil
+        if #reason > 52 then
+            reason = string.sub(reason, 1, 52) .. "..."
         end
+        searchStatusLabel.Text = "Engine unavailable: " .. reason
+        return nil
     end
-
     -- Keep the completed analysis visible even if the opponent moved while
     -- Stockfish was thinking. It is display-only once its original position
     -- is gone; playRecommendation() separately validates the live board.
@@ -1632,12 +1736,6 @@ local function processAccuracyJob(job, suppliedPostResult)
         return false
     end
 
-    -- Never hammer the service after it has indicated HIGH_USAGE. Accuracy is
-    -- optional; engine move generation always remains the priority.
-    if apiNow() < state.ApiHighUsageUntil then
-        return false
-    end
-
     local bestResult = job.preResult
     if not bestResult
         and job.preFen == state.AccuracyBaselineFen
@@ -1742,7 +1840,7 @@ local function ensureAccuracyBaseline(board, snapshot)
     -- Do not generate an extra API request for every ply. Accuracy is sampled
     -- every N moves PER SIDE, so White and Black both receive analysis while
     -- the engine remains the priority.
-    if isPlayerTurn(board) or apiNow() < state.ApiHighUsageUntil then
+    if isPlayerTurn(board) then
         return
     end
 
