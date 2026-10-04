@@ -34,15 +34,17 @@ local CHESS_API_DEPTH = 18
 local CHESS_API_MAX_THINKING_MS = 100
 -- chess-api.com does not publish a numeric HIGH_USAGE quota. Keep a strict
 -- total request budget anyway, and make the budget persist across teleports.
-local API_NORMAL_REQUEST_GAP = 3.0
-local API_NORMAL_MAX_REQUESTS_PER_MINUTE = 20
-local API_RECOVERY_REQUEST_GAP = 5.0
-local API_RECOVERY_MAX_REQUESTS_PER_MINUTE = 10
+local API_NORMAL_REQUEST_GAP = 4.0
+local API_NORMAL_MAX_REQUESTS_PER_MINUTE = 30
+local API_RECOVERY_REQUEST_GAP = 6.0
+local API_RECOVERY_MAX_REQUESTS_PER_MINUTE = 15
 local API_RECOVERY_DEPTH = 12
 local API_RECOVERY_MAX_THINKING_MS = 50
-local API_FAILURE_BACKOFF = 5.0
-local API_HIGH_USAGE_COOLDOWN = 15
+local API_FAILURE_BACKOFF = 6.0
+local API_HIGH_USAGE_COOLDOWN = 30
 local API_RECOVERY_MODE_DURATION = 180
+local API_ACCURACY_SAMPLE_EVERY = 3
+local API_ENGINE_RETRY_COUNT = 1
 local API_CACHE_TTL = 600
 local API_CACHE_MAX_ENTRIES = 300
 local CONFIG_FILE = "prometheus_stockfish_config.json"
@@ -61,7 +63,7 @@ local AutoPlayState = executorEnv
 -- Persist API usage state/cache through teleports. This reduces repeated
 -- opening-position requests and prevents a fresh script instance from
 -- immediately resetting the usage limiter.
-local sharedApi = executorEnv.__CHESS_API_STATE
+local sharedApi = executorEnv.__CHESS_API_STATE_V3
 if type(sharedApi) ~= "table" then
     sharedApi = {
         RequestTimes = {},
@@ -70,7 +72,7 @@ if type(sharedApi) ~= "table" then
         HighUsageUntil = 0,
         RecoveryUntil = 0,
     }
-    executorEnv.__CHESS_API_STATE = sharedApi
+    executorEnv.__CHESS_API_STATE_V3 = sharedApi
 end
 sharedApi.RequestTimes = type(sharedApi.RequestTimes) == "table" and sharedApi.RequestTimes or {}
 sharedApi.Cache = type(sharedApi.Cache) == "table" and sharedApi.Cache or {}
@@ -259,6 +261,8 @@ local state = {
     AccuracyCount = 0,
     AccuracyGeneration = 0,
     AccuracyMoveSerial = 0,
+    WhiteAccuracyMoveSerial = 0,
+    BlackAccuracyMoveSerial = 0,
     LastAccuracyDisplayedSerial = 0,
     CurrentGameId = nil,
     LastSnapshot = nil,
@@ -565,6 +569,11 @@ end
 local function isHighUsageText(value)
     return type(value) == "string"
         and string.find(string.upper(value), "HIGH_USAGE", 1, true) ~= nil
+end
+
+local function isAccuracySampleForSide(side, nextCount)
+    return side == "White" and (nextCount % API_ACCURACY_SAMPLE_EVERY == 0)
+        or side == "Black" and (nextCount % API_ACCURACY_SAMPLE_EVERY == 0)
 end
 
 local function apiProfile()
@@ -1468,24 +1477,37 @@ local function analyzeCurrent(board)
 
     if not ok or not result then
         local reason = tostring(result or "unknown error")
+
+        -- A HIGH_USAGE response should not immediately force a random/local
+        -- fallback move. The API layer has already switched to its recovery
+        -- profile (slower spacing + depth 12/50 ms), so give that profile one
+        -- controlled retry for the actual engine move. Accuracy requests never
+        -- get this retry because they are optional.
         if isHighUsageText(reason) then
-            local fallback = fallbackAnalysis(board)
-            if fallback then
-                fallback.board = board
-                fallback.key = generationKey
-                fallback.positionFen = positionFen
-                fallback.side = analysisSide
-                fallback.thinkingMs = 0
-                searchStatusLabel.Text = "API busy • fallback move"
-                state.Recommendation = fallback
-                return fallback
+            for _ = 1, API_ENGINE_RETRY_COUNT do
+                if state.Destroyed then
+                    return nil
+                end
+                searchStatusLabel.Text = "API recovering..."
+                local retryOk, retryResult = pcall(function()
+                    return analyzePosition(board, state.LastMoveUci)
+                end)
+                if retryOk and retryResult then
+                    ok = true
+                    result = retryResult
+                    break
+                end
+                reason = tostring(retryResult or reason)
             end
         end
-        if #reason > 52 then
-            reason = string.sub(reason, 1, 52) .. "..."
+
+        if not ok or not result then
+            if #reason > 52 then
+                reason = string.sub(reason, 1, 52) .. "..."
+            end
+            searchStatusLabel.Text = "Engine unavailable: " .. reason
+            return nil
         end
-        searchStatusLabel.Text = "Engine failed: " .. reason
-        return nil
     end
 
     -- Keep the completed analysis visible even if the opponent moved while
@@ -1717,10 +1739,22 @@ local function ensureAccuracyBaseline(board, snapshot)
         return
     end
 
-    -- On the player's turn analyzeCurrent() will establish the baseline.
-    -- When it is the opponent's turn, we need one initial position analysis
-    -- so the first opponent move can also be scored correctly.
+    -- Do not generate an extra API request for every ply. Accuracy is sampled
+    -- every N moves PER SIDE, so White and Black both receive analysis while
+    -- the engine remains the priority.
     if isPlayerTurn(board) or apiNow() < state.ApiHighUsageUntil then
+        return
+    end
+
+    local nextCount
+    local side = board.activeTeam == true and "White" or "Black"
+    if side == "White" then
+        nextCount = state.WhiteAccuracyMoveSerial + 1
+    else
+        nextCount = state.BlackAccuracyMoveSerial + 1
+    end
+
+    if not isAccuracySampleForSide(side, nextCount) then
         return
     end
 
@@ -2027,6 +2061,8 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.AccuracyBaselineFen = nil
         state.AccuracyBaselineResult = nil
         state.AccuracyMoveSerial = 0
+        state.WhiteAccuracyMoveSerial = 0
+        state.BlackAccuracyMoveSerial = 0
         state.AccuracySum = 0
         state.AccuracyCount = 0
         state.WhiteAccuracyMoves = {}
@@ -2102,6 +2138,8 @@ task.spawn(function()
         if gameId ~= state.CurrentGameId then
             state.AccuracyGeneration = state.AccuracyGeneration + 1
             state.AccuracyMoveSerial = 0
+            state.WhiteAccuracyMoveSerial = 0
+            state.BlackAccuracyMoveSerial = 0
             state.LastAccuracyDisplayedSerial = 0
             state.CurrentGameId = gameId
             state.Recommendation = nil
@@ -2157,27 +2195,39 @@ task.spawn(function()
 
                     state.AccuracyMoveSerial = state.AccuracyMoveSerial + 1
 
-                    -- Analyze every detected ply. White and Black are stored
-                    -- separately so neither side is omitted.
-                    local preResult = nil
-                    if previousSnapshot.fen == state.AccuracyBaselineFen
-                        and type(state.AccuracyBaselineResult) == "table" then
-                        preResult = state.AccuracyBaselineResult
-                    elseif previousSnapshot.fen == state.LastEngineFen
-                        and type(state.LastEngineResult) == "table" then
-                        preResult = state.LastEngineResult
+                    local sideMoveNumber
+                    if move.side == "White" then
+                        state.WhiteAccuracyMoveSerial = state.WhiteAccuracyMoveSerial + 1
+                        sideMoveNumber = state.WhiteAccuracyMoveSerial
+                    else
+                        state.BlackAccuracyMoveSerial = state.BlackAccuracyMoveSerial + 1
+                        sideMoveNumber = state.BlackAccuracyMoveSerial
                     end
 
-                    state.PendingAccuracy = {
-                        generation = state.AccuracyGeneration,
-                        preFen = previousSnapshot.fen,
-                        postFen = snapshot.fen,
-                        preResult = preResult,
-                        uci = move.uci,
-                        side = move.side,
-                        playedMove = move.from .. "-" .. move.to,
-                        moveNumber = math.ceil(state.AccuracyMoveSerial / 2),
-                    }
+                    -- Accuracy is sampled every N moves per side. This keeps
+                    -- both White and Black boxes populated without adding a
+                    -- second API request for every single ply.
+                    if isAccuracySampleForSide(move.side, sideMoveNumber) then
+                        local preResult = nil
+                        if previousSnapshot.fen == state.AccuracyBaselineFen
+                            and type(state.AccuracyBaselineResult) == "table" then
+                            preResult = state.AccuracyBaselineResult
+                        elseif previousSnapshot.fen == state.LastEngineFen
+                            and type(state.LastEngineResult) == "table" then
+                            preResult = state.LastEngineResult
+                        end
+
+                        state.PendingAccuracy = {
+                            generation = state.AccuracyGeneration,
+                            preFen = previousSnapshot.fen,
+                            postFen = snapshot.fen,
+                            preResult = preResult,
+                            uci = move.uci,
+                            side = move.side,
+                            playedMove = move.from .. "-" .. move.to,
+                            moveNumber = sideMoveNumber,
+                        }
+                    end
                 end
             end
         end
