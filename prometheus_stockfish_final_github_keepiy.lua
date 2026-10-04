@@ -117,11 +117,16 @@ end
 
 loadConfig()
 
-local function saveConfig()
-    if type(writefile) ~= "function" then
-        return
+-- Keep the toggle in the executor environment too. This survives a
+-- teleport re-execution even when the workspace config is not yet available.
+local runtimeConfig = executorEnv.__CHESS_CONFIG
+if type(runtimeConfig) == "table" then
+    if type(runtimeConfig.AutoRanked) == "boolean" then
+        config.AutoRanked = runtimeConfig.AutoRanked
     end
+end
 
+local function saveConfig()
     local payload = {
         EngineSeconds = config.EngineSeconds,
         AccuracySeconds = config.AccuracySeconds,
@@ -136,7 +141,17 @@ local function saveConfig()
         },
     }
 
-    pcall(writefile, CONFIG_FILE, HttpService:JSONEncode(payload))
+    executorEnv.__CHESS_CONFIG = {
+        EngineSeconds = payload.EngineSeconds,
+        AccuracySeconds = payload.AccuracySeconds,
+        AutoPlay = payload.AutoPlay,
+        AutoRanked = payload.AutoRanked,
+        MenuKeyCode = payload.MenuKeyCode,
+    }
+
+    if type(writefile) == "function" then
+        pcall(writefile, CONFIG_FILE, HttpService:JSONEncode(payload))
+    end
 end
 
 -- KeepIY-style teleport persistence.
@@ -161,16 +176,6 @@ local function keepiy()
     local ok = pcall(queue, queuedCode)
     return ok
 end
-
-Players.LocalPlayer.OnTeleport:Connect(function()
-    if teleportCheck then
-        return
-    end
-
-    teleportCheck = true
-    saveConfig()
-    keepiy()
-end)
 
 local state = {
     Enabled = config.AutoPlay,
@@ -198,6 +203,34 @@ if state.AutoRanked then
     state.Enabled = true
 end
 config.AutoPlay = state.Enabled
+
+executorEnv.__CHESS_CONFIG = {
+    EngineSeconds = config.EngineSeconds,
+    AccuracySeconds = config.AccuracySeconds,
+    AutoPlay = config.AutoPlay,
+    AutoRanked = config.AutoRanked,
+    MenuKeyCode = config.MenuKeyCode,
+}
+
+-- Install this only after `state` exists so the callback captures the
+-- correct local state value.
+Players.LocalPlayer.OnTeleport:Connect(function()
+    if teleportCheck then
+        return
+    end
+
+    teleportCheck = true
+
+    -- Capture the live UI state immediately before the teleport.
+    config.EngineSeconds = state.EngineSeconds
+    config.AccuracySeconds = state.AccuracySeconds
+    config.AutoPlay = state.Enabled
+    config.AutoRanked = state.AutoRanked
+    config.MenuKeyCode = state.MenuKeyCode.Name
+
+    saveConfig()
+    keepiy()
+end)
 
 AutoPlayState.__CHESS_AUTOPLAYER = state
 
