@@ -2,9 +2,18 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- Anti-AFK
+local VirtualUser = game:GetService("VirtualUser")
+
+LocalPlayer.Idled:Connect(function()
+	VirtualUser:CaptureController()
+	VirtualUser:ClickButton2(Vector2.new(0, 0))
+end)
 
 local MatchClient = require((PlayerGui:WaitForChild("Client"):WaitForChild("MatchClient")) :: any)
 local MenuModule = require((PlayerGui:WaitForChild("menu"):WaitForChild("menu")) :: any)
@@ -16,6 +25,9 @@ local STOCKFISH_URL = "http://127.0.0.1:5001/bestmove"
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
+local SERVER_LIST_LIMIT = 50
+local SERVER_SCAN_PAGES = 5
+local SERVER_HOP_DELAY = 0.8
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/prometheus_stockfish_final_github_keepiy.lua"
 
 local executorEnv = getgenv and getgenv() or _G
@@ -49,7 +61,6 @@ local config = {
     AccuracySeconds = DEFAULT_ACCURACY_SECONDS,
     AutoPlay = false,
     AutoRanked = false,
-    GPUOptimization = false,
     MenuKeyCode = "RightShift",
     XScale = 0,
     XOffset = 24,
@@ -93,10 +104,6 @@ local function loadConfig()
         config.AutoRanked = saved.AutoRanked
     end
 
-    if type(saved.GPUOptimization) == "boolean" then
-        config.GPUOptimization = saved.GPUOptimization
-    end
-
     if type(saved.MenuKeyCode) == "string" then
         local enumValue = Enum.KeyCode[saved.MenuKeyCode]
         if enumValue then
@@ -129,9 +136,6 @@ if type(runtimeConfig) == "table" then
     if type(runtimeConfig.AutoRanked) == "boolean" then
         config.AutoRanked = runtimeConfig.AutoRanked
     end
-    if type(runtimeConfig.GPUOptimization) == "boolean" then
-        config.GPUOptimization = runtimeConfig.GPUOptimization
-    end
 end
 
 local function saveConfig()
@@ -140,7 +144,6 @@ local function saveConfig()
         AccuracySeconds = config.AccuracySeconds,
         AutoPlay = config.AutoPlay,
         AutoRanked = config.AutoRanked,
-        GPUOptimization = config.GPUOptimization,
         MenuKeyCode = config.MenuKeyCode,
         Position = {
             XScale = config.XScale,
@@ -155,7 +158,6 @@ local function saveConfig()
         AccuracySeconds = payload.AccuracySeconds,
         AutoPlay = payload.AutoPlay,
         AutoRanked = payload.AutoRanked,
-        GPUOptimization = payload.GPUOptimization,
         MenuKeyCode = payload.MenuKeyCode,
     }
 
@@ -207,8 +209,6 @@ local state = {
     AutoRankedBusy = false,
     NextRankedAttempt = 0,
     PendingPlayKey = nil,
-    NeedsFreshQueue = true,
-    QueueStartedAt = 0,
 }
 
 if state.AutoRanked then
@@ -216,75 +216,11 @@ if state.AutoRanked then
 end
 config.AutoPlay = state.Enabled
 
-local GPUConnections = {}
-
-local function disableGPUOptimization()
-    state.GPUOptimization = false
-
-    for _, connection in ipairs(GPUConnections) do
-        pcall(function() connection:Disconnect() end)
-    end
-    GPUConnections = {}
-
-    pcall(function()
-        game:GetService("RunService"):Set3dRenderingEnabled(true)
-    end)
-
-    pcall(function()
-        if type(setfpscap) == "function" then
-            setfpscap(360)
-        end
-    end)
-end
-
-local function enableGPUOptimization()
-    if state.GPUOptimization then
-        return
-    end
-
-    state.GPUOptimization = true
-
-    if type(setfpscap) ~= "function" then
-        return
-    end
-
-    GPUConnections[#GPUConnections + 1] = UserInputService.WindowFocusReleased:Connect(function()
-        if not state.GPUOptimization or state.Destroyed then
-            return
-        end
-
-        pcall(function()
-            game:GetService("RunService"):Set3dRenderingEnabled(false)
-            setfpscap(5)
-        end)
-    end)
-
-    GPUConnections[#GPUConnections + 1] = UserInputService.WindowFocused:Connect(function()
-        if not state.GPUOptimization or state.Destroyed then
-            return
-        end
-
-        pcall(function()
-            game:GetService("RunService"):Set3dRenderingEnabled(true)
-            setfpscap(360)
-        end)
-    end)
-end
-
-local function setGPUOptimization(enabled)
-    if enabled then
-        enableGPUOptimization()
-    else
-        disableGPUOptimization()
-    end
-end
-
 executorEnv.__CHESS_CONFIG = {
     EngineSeconds = config.EngineSeconds,
     AccuracySeconds = config.AccuracySeconds,
     AutoPlay = config.AutoPlay,
     AutoRanked = config.AutoRanked,
-    GPUOptimization = config.GPUOptimization,
     MenuKeyCode = config.MenuKeyCode,
 }
 
@@ -297,15 +233,16 @@ Players.LocalPlayer.OnTeleport:Connect(function()
 
     teleportCheck = true
 
-    -- Capture the live UI state immediately before the teleport.
     config.EngineSeconds = state.EngineSeconds
     config.AccuracySeconds = state.AccuracySeconds
     config.AutoPlay = state.Enabled
     config.AutoRanked = state.AutoRanked
-    config.GPUOptimization = state.GPUOptimization
     config.MenuKeyCode = state.MenuKeyCode.Name
 
     saveConfig()
+
+    getgenv().__CHESS_TELEPORT_HANDOFF = true
+
     keepiy()
 end)
 
@@ -801,7 +738,7 @@ gui.Parent = PlayerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(350, 325)
+main.Size = UDim2.fromOffset(350, 285)
 main.Position = UDim2.new(config.XScale, config.XOffset, config.YScale, config.YOffset)
 main.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
 main.BorderSizePixel = 0
@@ -948,24 +885,17 @@ autoRankedToggle = makeToggle(138, "Auto Ranked Loop", state.AutoRanked, functio
     saveConfig()
 end)
 
-local gpuOptimizationToggle = makeToggle(176, "Unfocused GPU Optimization", state.GPUOptimization, function(enabled)
-    state.GPUOptimization = enabled
-    config.GPUOptimization = enabled
-    setGPUOptimization(enabled)
-    saveConfig()
-end)
-
-local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 214), UDim2.fromOffset(318, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
+local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 176), UDim2.fromOffset(318, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
 bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 236), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
+local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 198), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 258), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 220), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
 
-local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 305), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
+local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 267), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
 menuKeyButton.Size = UDim2.fromOffset(120, 22)
-menuKeyButton.Position = UDim2.fromOffset(214, 302)
+menuKeyButton.Position = UDim2.fromOffset(214, 264)
 menuKeyButton.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
 menuKeyButton.BorderSizePixel = 0
 menuKeyButton.AutoButtonColor = false
@@ -974,11 +904,6 @@ menuKeyButton.TextSize = 9
 menuKeyButton.TextColor3 = Color3.fromRGB(235, 238, 245)
 menuKeyButton.Text = state.MenuKeyCode.Name
 menuKeyButton.Parent = main
-
-if state.GPUOptimization then
-    enableGPUOptimization()
-end
-
 local keyCorner = Instance.new("UICorner")
 keyCorner.CornerRadius = UDim.new(0, 6)
 keyCorner.Parent = menuKeyButton
@@ -1169,29 +1094,120 @@ local function playRecommendation(recommendation)
     return ok
 end
 
-local function getMatchfinding()
-    local ok, module = pcall(function()
-        return require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
-    end)
+local function findRankedButton()
+    local menuGui = PlayerGui:FindFirstChild("menu")
+    if not menuGui then
+        return nil
+    end
 
-    if ok and type(module) == "table" then
-        return module
+    local frame = menuGui:FindFirstChild("Frame")
+    local ranked = frame and frame:FindFirstChild("Ranked")
+    local rankedFrame = ranked and ranked:FindFirstChild("Frame")
+    local button = rankedFrame and rankedFrame:FindFirstChild("button")
+
+    if button and button:IsA("GuiButton") then
+        return button
     end
 
     return nil
 end
 
-local function waitForQueueState(matchfinding, desired, timeout)
-    local deadline = os.clock() + timeout
+local function getServerList(cursor)
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=%d%s",
+        tostring(game.PlaceId),
+        SERVER_LIST_LIMIT,
+        cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+    )
 
-    while os.clock() < deadline do
-        if matchfinding.inque == desired then
-            return true
+    local ok, raw = pcall(function()
+        if type(requestFunction) == "function" then
+            local response = requestFunction({
+                Url = url,
+                Method = "GET",
+            })
+            if not response then
+                error("No response from Roblox server list")
+            end
+            local body = response.Body or response.body
+            if type(body) ~= "string" then
+                error("Invalid server-list response")
+            end
+            return body
         end
-        task.wait(0.05)
+        return game:HttpGet(url)
+    end)
+
+    if not ok then
+        return nil
     end
 
-    return matchfinding.inque == desired
+    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not decodedOk or type(data) ~= "table" then
+        return nil
+    end
+
+    return data
+end
+
+local function findMostPopulatedServer()
+    local currentJobId = tostring(game.JobId)
+    local best = nil
+    local cursor = nil
+
+    for _ = 1, SERVER_SCAN_PAGES do
+        local page = getServerList(cursor)
+        if not page then
+            break
+        end
+
+        for _, server in ipairs(page.data or {}) do
+            local id = tostring(server.id or "")
+            local playing = tonumber(server.playing) or 0
+            local maxPlayers = tonumber(server.maxPlayers) or 0
+
+            if id ~= ""
+                and id ~= currentJobId
+                and maxPlayers > 0
+                and playing < maxPlayers then
+                if not best or playing > best.playing then
+                    best = {
+                        id = id,
+                        playing = playing,
+                        maxPlayers = maxPlayers,
+                    }
+                end
+            end
+        end
+
+        cursor = page.nextPageCursor
+        if not cursor or cursor == "null" then
+            break
+        end
+
+        task.wait(0.15)
+    end
+
+    return best
+end
+
+local function hopToMostPopulatedServer()
+    local target = findMostPopulatedServer()
+    if not target then
+        return false
+    end
+
+    task.wait(SERVER_HOP_DELAY)
+
+    local ok = pcall(function()
+        TeleportService:TeleportToPlaceInstance(
+            game.PlaceId,
+            target.id,
+            LocalPlayer
+        )
+    end)
+
+    return ok
 end
 
 local function queueRanked()
@@ -1204,59 +1220,49 @@ local function queueRanked()
         return false
     end
 
+    local button = findRankedButton()
+    if not button or not button.Visible then
+        return false
+    end
+
+    local matchfinding = nil
+    pcall(function()
+        matchfinding = require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
+    end)
+
+    if matchfinding and matchfinding.inque then
+        return false
+    end
+
     if os.clock() < state.NextRankedAttempt then
         return false
     end
 
-    local matchfinding = getMatchfinding()
-    if not matchfinding then
-        return false
-    end
-
-    -- After a finished match the game's queue state can remain marked as
-    -- active even though the old match is gone. Reset that state once before
-    -- starting the next queue cycle. This is the state that a server hop was
-    -- previously resetting for us.
-    if matchfinding.inque and state.NeedsFreshQueue then
-        state.AutoRankedBusy = true
-        state.NextRankedAttempt = os.clock() + 1.5
-
-        pcall(function()
-            matchfinding:leave()
-        end)
-
-        waitForQueueState(matchfinding, false, 3)
-        task.wait(0.25)
-
-        state.AutoRankedBusy = false
-
-        if matchfinding.inque then
-            return false
-        end
-    elseif matchfinding.inque then
-        -- A fresh queue is already active. Do not cancel it on every loop.
-        return true
-    end
-
     state.AutoRankedBusy = true
-    state.NextRankedAttempt = os.clock() + 2
+    state.NextRankedAttempt = os.clock() + 5
 
-    local ok = pcall(function()
-        matchfinding:toggleque()
-    end)
+    local fired = false
 
-    if ok then
-        state.QueueStartedAt = os.clock()
-        state.NeedsFreshQueue = false
+    if type(firesignal) == "function" then
+        local ok = pcall(firesignal, button.Activated)
+        fired = ok
+    elseif type(getconnections) == "function" then
+        local ok, connections = pcall(getconnections, button.Activated)
+        if ok and type(connections) == "table" then
+            for _, connection in ipairs(connections) do
+                if type(connection.Fire) == "function" then
+                    pcall(connection.Fire, connection)
+                    fired = true
+                end
+            end
+        end
     end
 
-    task.delay(0.5, function()
-        if not state.Destroyed then
-            state.AutoRankedBusy = false
-        end
+    task.delay(0.35, function()
+        state.AutoRankedBusy = false
     end)
 
-    return ok
+    return fired
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
@@ -1269,7 +1275,6 @@ EndGame.OnClientEvent:Connect(function(matchId)
     end
 
     state.AutoRankedBusy = true
-    state.NeedsFreshQueue = true
 
     task.spawn(function()
         task.wait(0.35)
@@ -1306,9 +1311,25 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.PendingPlayKey = nil
         state.NextRankedAttempt = os.clock() + 1
 
-        task.wait(0.5)
+        -- A fresh server resets matchmaking state (including a possibly stale
+        -- matchfinding.inque flag), which avoids getting stuck in the ranked queue.
+        if state.AutoRanked then
+            task.spawn(function()
+                hopToMostPopulatedServer()
+            end)
+            return
+        end
+
+        task.wait(1)
         state.AutoRankedBusy = false
     end)
+end)
+
+TeleportService.TeleportInitFailed:Connect(function()
+    if state.AutoRanked and not state.Destroyed then
+        state.AutoRankedBusy = false
+        state.NextRankedAttempt = os.clock() + 2
+    end
 end)
 
 state.Destroy = function()
@@ -1319,7 +1340,6 @@ state.Destroy = function()
     state.Destroyed = true
     state.Enabled = false
     state.AutoRanked = false
-    disableGPUOptimization()
     saveConfig()
 
     pcall(function() gui:Destroy() end)
