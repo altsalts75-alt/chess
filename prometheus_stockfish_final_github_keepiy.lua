@@ -9,11 +9,22 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- Anti-AFK
 local VirtualUser = game:GetService("VirtualUser")
-
 LocalPlayer.Idled:Connect(function()
-	VirtualUser:CaptureController()
-	VirtualUser:ClickButton2(Vector2.new(0, 0))
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new(0, 0))
 end)
+
+-- Wait for the game's UI to finish initializing after teleport.
+-- MatchClient requires VersusScreen to already exist.
+local VersusScreen
+
+repeat
+    VersusScreen = PlayerGui:FindFirstChild("VersusScreen")
+
+    if not VersusScreen then
+        task.wait(1)
+    end
+until VersusScreen
 
 local MatchClient = require((PlayerGui:WaitForChild("Client"):WaitForChild("MatchClient")) :: any)
 local MenuModule = require((PlayerGui:WaitForChild("menu"):WaitForChild("menu")) :: any)
