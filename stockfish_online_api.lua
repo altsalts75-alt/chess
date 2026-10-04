@@ -47,6 +47,20 @@ local requestFunction = executorEnv.request
     or (executorSyn and executorSyn.request)
 local AutoPlayState = executorEnv
 
+-- Prevent a teleport-queued execution and an executor autoexec from both
+-- starting the bot in the same Roblox server. Only one instance per JobId
+-- may run.
+local bootGuard = executorEnv.__CHESS_BOOT_GUARD
+if type(bootGuard) == "table"
+    and bootGuard.Active == true
+    and tostring(bootGuard.JobId) == tostring(game.JobId) then
+    return
+end
+executorEnv.__CHESS_BOOT_GUARD = {
+    Active = true,
+    JobId = tostring(game.JobId),
+}
+
 local previousInstance = AutoPlayState.__CHESS_AUTOPLAYER
 if previousInstance then
     pcall(function()
@@ -219,6 +233,20 @@ local state = {
     LastMoveUci = nil,
     LastEngineFen = nil,
     LastEngineResult = nil,
+
+    -- Ranked-cycle runtime guards. These do not alter the saved AutoRanked
+    -- setting; only the user's toggle/config does that.
+    RankedQueuePending = false,
+    RankedQueueStartedAt = 0,
+    RankedMatchActive = false,
+    RankedActiveMatchId = nil,
+    RankedEndHandledId = nil,
+    RankedPostGame = false,
+    RankedTeleporting = false,
+    RankedStartupReadyAt = os.clock() + 2,
+
+    WhiteAccuracyMoves = {},
+    BlackAccuracyMoves = {},
 }
 
 if state.AutoRanked then
@@ -888,7 +916,7 @@ gui.Parent = PlayerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(350, 275)
+main.Size = UDim2.fromOffset(382, 395)
 main.Position = UDim2.new(config.XScale, config.XOffset, config.YScale, config.YOffset)
 main.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
 main.BorderSizePixel = 0
@@ -1009,22 +1037,72 @@ autoRankedToggle = makeToggle(100, "Auto Ranked Loop", state.AutoRanked, functio
         autoPlayToggle.value = true
         autoPlayToggle.button.Text = "ON"
         autoPlayToggle.button.BackgroundColor3 = Color3.fromRGB(42, 160, 105)
+
+        state.RankedQueuePending = false
+        state.RankedPostGame = false
+        state.RankedTeleporting = false
+        state.AutoRankedBusy = false
+        state.NextRankedAttempt = os.clock() + 0.75
+        state.RankedStartupReadyAt = os.clock() + 0.75
+        state.RankedMatchActive = MatchClient.currentMatch ~= nil
+        state.RankedActiveMatchId = MatchClient.currentMatch and tostring(MatchClient.currentMatch.id) or nil
+    else
+        -- Turning Auto Ranked off only changes its selected state and clears
+        -- runtime guards. The saved value remains exactly what the user chose.
+        state.RankedQueuePending = false
+        state.RankedPostGame = false
+        state.RankedTeleporting = false
+        state.AutoRankedBusy = false
     end
 
     saveConfig()
 end)
 
-local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 138), UDim2.fromOffset(318, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
+local bestMoveLabel = makeLabel(main, UDim2.fromOffset(16, 138), UDim2.fromOffset(350, 23), "Best move: --", 12, Color3.fromRGB(225, 229, 238))
 bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
+local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromOffset(350, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 182), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+local function makeAccuracyBox(position, titleText)
+    makeLabel(main, position, UDim2.fromOffset(130, 16), titleText, 9, Color3.fromRGB(130, 138, 155))
 
-local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 238), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(350, 58)
+    box.Position = UDim2.fromOffset(16, position.Y.Offset + 16)
+    box.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
+    box.BorderSizePixel = 0
+    box.ClearTextOnFocus = false
+    box.MultiLine = true
+    box.TextEditable = false
+    box.Font = Enum.Font.GothamMedium
+    box.TextSize = 9
+    box.TextColor3 = Color3.fromRGB(210, 215, 225)
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.TextYAlignment = Enum.TextYAlignment.Top
+    box.TextWrapped = false
+    box.Text = "No moves analyzed yet."
+    box.Parent = main
+
+    local boxCorner = Instance.new("UICorner")
+    boxCorner.CornerRadius = UDim.new(0, 7)
+    boxCorner.Parent = box
+
+    local boxStroke = Instance.new("UIStroke")
+    boxStroke.Color = Color3.fromRGB(45, 47, 55)
+    boxStroke.Thickness = 1
+    boxStroke.Parent = box
+
+    return box
+end
+
+local whiteAccuracyBox = makeAccuracyBox(UDim2.fromOffset(16, 181), "WHITE MOVES")
+local blackAccuracyBox = makeAccuracyBox(UDim2.fromOffset(16, 257), "BLACK MOVES")
+local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 333), UDim2.fromOffset(350, 22), "Game accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+
+local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 362), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
 menuKeyButton.Size = UDim2.fromOffset(120, 22)
-menuKeyButton.Position = UDim2.fromOffset(214, 235)
+menuKeyButton.Position = UDim2.fromOffset(246, 359)
 menuKeyButton.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
 menuKeyButton.BorderSizePixel = 0
 menuKeyButton.AutoButtonColor = false
@@ -1034,7 +1112,6 @@ menuKeyButton.TextColor3 = Color3.fromRGB(235, 238, 245)
 menuKeyButton.Text = state.MenuKeyCode.Name
 menuKeyButton.Parent = main
 
-
 local keyCorner = Instance.new("UICorner")
 keyCorner.CornerRadius = UDim.new(0, 6)
 keyCorner.Parent = menuKeyButton
@@ -1042,7 +1119,6 @@ local keyStroke = Instance.new("UIStroke")
 keyStroke.Color = Color3.fromRGB(55, 58, 70)
 keyStroke.Thickness = 1
 keyStroke.Parent = menuKeyButton
-
 
 local waitingForKey = false
 menuKeyButton.MouseButton1Click:Connect(function()
@@ -1224,6 +1300,50 @@ local function playRecommendation(recommendation)
     return ok
 end
 
+local function setAccuracyBoxes()
+    whiteAccuracyBox.Text = (#state.WhiteAccuracyMoves > 0)
+        and table.concat(state.WhiteAccuracyMoves, "\n")
+        or "No moves analyzed yet."
+    blackAccuracyBox.Text = (#state.BlackAccuracyMoves > 0)
+        and table.concat(state.BlackAccuracyMoves, "\n")
+        or "No moves analyzed yet."
+end
+
+local function appendAccuracyMove(job, accuracy, classification, cpl)
+    local moveNumber = tonumber(job.moveNumber) or 1
+    local line = string.format(
+        "%d. %s  •  %.1f%% %s  •  %d CPL",
+        moveNumber,
+        job.playedMove,
+        accuracy,
+        classification,
+        math.floor((cpl or 0) + 0.5)
+    )
+
+    local target = job.side == "White" and state.WhiteAccuracyMoves or state.BlackAccuracyMoves
+    table.insert(target, line)
+    while #target > 30 do
+        table.remove(target, 1)
+    end
+    setAccuracyBoxes()
+end
+
+local function showAccuracyUnavailable(job)
+    local moveNumber = tonumber(job.moveNumber) or 1
+    local line = string.format(
+        "%d. %s  •  Accuracy unavailable",
+        moveNumber,
+        job.playedMove
+    )
+
+    local target = job.side == "White" and state.WhiteAccuracyMoves or state.BlackAccuracyMoves
+    table.insert(target, line)
+    while #target > 30 do
+        table.remove(target, 1)
+    end
+    setAccuracyBoxes()
+end
+
 local function processAccuracyJob(job)
     if not job or state.Destroyed then
         return
@@ -1235,12 +1355,13 @@ local function processAccuracyJob(job)
 
     local bestResult
 
+    -- For our own move, analyzeCurrent() has already analyzed the exact
+    -- pre-move position, so reuse that unrestricted engine result.
     if job.fen == state.LastEngineFen and type(state.LastEngineResult) == "table" then
         bestResult = state.LastEngineResult
     end
 
     local bestOk = true
-
     if not bestResult then
         bestOk, bestResult = pcall(function()
             return requestStockfish({
@@ -1250,15 +1371,13 @@ local function processAccuracyJob(job)
     end
 
     if not bestOk or not bestResult then
-        accuracyLabel.Text = string.format(
-            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-            job.side,
-            job.playedMove,
-            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-        )
+        showAccuracyUnavailable(job)
         return
     end
 
+    -- searchmoves forces Stockfish to evaluate ONLY the played move. Its
+    -- returned move is therefore not a valid test for whether the move was
+    -- optimal. Compare the unrestricted and restricted evaluations instead.
     local playedOk, playedResult = pcall(function()
         return requestStockfish({
             fen = job.fen,
@@ -1267,43 +1386,29 @@ local function processAccuracyJob(job)
     end)
 
     if not playedOk or not playedResult then
-        accuracyLabel.Text = string.format(
-            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-            job.side,
-            job.playedMove,
-            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-        )
+        showAccuracyUnavailable(job)
         return
     end
 
-    local bestMove = bestResult.move or bestResult.lan
-    local accuracy
-    local cpl
-
-    if bestMove == job.uci then
-        accuracy = 100
-        cpl = 0
-    else
-        local bestCp = apiResultToCp(bestResult)
-        local playedCp = apiResultToCp(playedResult)
-
-        if bestCp ~= nil and playedCp ~= nil then
-            if job.side == "White" then
-                cpl = math.max(0, bestCp - playedCp)
-            else
-                cpl = math.max(0, playedCp - bestCp)
-            end
-            accuracy = accuracyFromCpl(cpl)
-        end
+    local bestCp = apiResultToCp(bestResult)
+    local playedCp = apiResultToCp(playedResult)
+    if bestCp == nil or playedCp == nil then
+        showAccuracyUnavailable(job)
+        return
     end
 
+    local cpl
+    if job.side == "White" then
+        -- chess-api.com reports centipawns from White's perspective.
+        cpl = math.max(0, bestCp - playedCp)
+    else
+        -- Black wants the evaluation to move lower.
+        cpl = math.max(0, playedCp - bestCp)
+    end
+
+    local accuracy = accuracyFromCpl(cpl)
     if accuracy == nil then
-        accuracyLabel.Text = string.format(
-            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-            job.side,
-            job.playedMove,
-            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-        )
+        showAccuracyUnavailable(job)
         return
     end
 
@@ -1316,15 +1421,12 @@ local function processAccuracyJob(job)
 
     local gameAccuracy = state.AccuracySum / state.AccuracyCount
     local classification = classifyAccuracy(accuracy)
+    appendAccuracyMove(job, accuracy, classification, cpl)
 
     accuracyLabel.Text = string.format(
-        "Last move: %s %s • %.0f%% %s • %d CPL\nGame accuracy: %.0f%%",
-        job.side,
-        job.playedMove,
-        accuracy,
-        classification,
-        math.floor((cpl or 0) + 0.5),
-        gameAccuracy
+        "Game accuracy: %.1f%%  •  %d analyzed",
+        gameAccuracy,
+        state.AccuracyCount
     )
 end
 
@@ -1460,7 +1562,17 @@ local function findRankedButton()
 end
 
 local function queueRanked()
-    if not state.AutoRanked or MatchClient.currentMatch ~= nil or state.AutoRankedBusy then
+    if not state.AutoRanked
+        or MatchClient.currentMatch ~= nil
+        or state.RankedQueuePending
+        or state.RankedMatchActive
+        or state.RankedPostGame
+        or state.RankedTeleporting
+        or state.AutoRankedBusy then
+        return false
+    end
+
+    if os.clock() < state.RankedStartupReadyAt then
         return false
     end
 
@@ -1480,6 +1592,10 @@ local function queueRanked()
     end)
 
     if matchfinding and matchfinding.inque then
+        -- Already queued. Never press Ranked again while this flag is active.
+        state.RankedQueuePending = true
+        state.RankedQueueStartedAt = os.clock()
+        state.AutoRankedBusy = true
         return false
     end
 
@@ -1487,6 +1603,9 @@ local function queueRanked()
         return false
     end
 
+    -- Lock before firing the exact known-working Ranked button signal.
+    state.RankedQueuePending = true
+    state.RankedQueueStartedAt = os.clock()
     state.AutoRankedBusy = true
     state.NextRankedAttempt = os.clock() + 5
 
@@ -1507,13 +1626,31 @@ local function queueRanked()
         end
     end
 
-    task.delay(0.35, function()
-        if not state.Destroyed then
+    if not fired then
+        state.RankedQueuePending = false
+        state.AutoRankedBusy = false
+        state.NextRankedAttempt = os.clock() + 2
+        return false
+    end
+
+    -- Do not release the queue lock after a fraction of a second. Keep it
+    -- until a real match appears. Only the 30-second timeout permits retrying.
+    task.delay(30, function()
+        if state.Destroyed or not state.AutoRanked then
+            return
+        end
+
+        if state.RankedQueuePending
+            and not state.RankedMatchActive
+            and MatchClient.currentMatch == nil
+            and os.clock() - state.RankedQueueStartedAt >= 30 then
+            state.RankedQueuePending = false
             state.AutoRankedBusy = false
+            state.NextRankedAttempt = os.clock() + 2
         end
     end)
 
-    return fired
+    return true
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
@@ -1521,10 +1658,21 @@ EndGame.OnClientEvent:Connect(function(matchId)
         return
     end
 
-    if state.AutoRankedBusy then
+    local incomingId = tostring(matchId or "")
+
+    -- Ignore stale EndGame events from an older match/script instance.
+    if state.RankedActiveMatchId and incomingId ~= tostring(state.RankedActiveMatchId) then
+        return
+    end
+    if state.RankedEndHandledId and incomingId == tostring(state.RankedEndHandledId) then
         return
     end
 
+    state.RankedEndHandledId = incomingId
+    state.RankedQueuePending = false
+    state.RankedMatchActive = false
+    state.RankedPostGame = true
+    state.RankedTeleporting = false
     state.AutoRankedBusy = true
 
     task.spawn(function()
@@ -1546,7 +1694,12 @@ EndGame.OnClientEvent:Connect(function(matchId)
             end
         end)
 
-        task.wait(0.1)
+        -- Wait for the real client match to disappear. This prevents the
+        -- main loop from treating an end-of-game transient as a new queue.
+        local deadline = os.clock() + 5
+        while not state.Destroyed and MatchClient.currentMatch ~= nil and os.clock() < deadline do
+            task.wait(0.1)
+        end
 
         pcall(function()
             local menuGui = PlayerGui:FindFirstChild("menu")
@@ -1564,22 +1717,47 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.LastMoveUci = nil
         state.LastEngineFen = nil
         state.LastEngineResult = nil
+        state.AccuracyMoveSerial = 0
+        state.AccuracySum = 0
+        state.AccuracyCount = 0
+        state.WhiteAccuracyMoves = {}
+        state.BlackAccuracyMoves = {}
+        setAccuracyBoxes()
+        accuracyLabel.Text = "Game accuracy: --"
         state.NextRankedAttempt = os.clock() + 1
 
-        if state.AutoRanked then
-            task.spawn(function()
-                hopToMostPopulatedServer()
-            end)
+        if not state.AutoRanked then
+            state.RankedPostGame = false
+            state.AutoRankedBusy = false
             return
         end
 
-        task.wait(0.5)
-        state.AutoRankedBusy = false
+        state.RankedTeleporting = true
+        state.AutoRankedBusy = true
+        local hopOk = false
+        local callOk, result = pcall(function()
+            return hopToMostPopulatedServer()
+        end)
+        if callOk and result then
+            hopOk = true
+        end
+
+        if not hopOk and not state.Destroyed then
+            state.RankedTeleporting = false
+            state.RankedPostGame = false
+            state.AutoRankedBusy = false
+            state.NextRankedAttempt = os.clock() + 2
+        end
     end)
 end)
 
 TeleportService.TeleportInitFailed:Connect(function()
     if state.AutoRanked and not state.Destroyed then
+        state.RankedTeleporting = false
+        state.RankedPostGame = false
+        state.RankedQueuePending = false
+        state.RankedMatchActive = MatchClient.currentMatch ~= nil
+        state.RankedActiveMatchId = MatchClient.currentMatch and tostring(MatchClient.currentMatch.id) or nil
         state.AutoRankedBusy = false
         state.NextRankedAttempt = os.clock() + 2
     end
@@ -1627,10 +1805,23 @@ task.spawn(function()
             state.LastMoveUci = nil
             state.LastEngineFen = nil
             state.LastEngineResult = nil
+            state.WhiteAccuracyMoves = {}
+            state.BlackAccuracyMoves = {}
+            setAccuracyBoxes()
+            accuracyLabel.Text = "Game accuracy: --"
+        end
 
-            if not gameId then
-                accuracyLabel.Text = "Last move: --\nGame accuracy: --"
+        -- A real MatchClient.currentMatch means matchmaking succeeded. While it
+        -- exists, the ranked queue is considered active and cannot fire again.
+        if currentMatch and not state.RankedPostGame and not state.RankedTeleporting then
+            if not state.RankedMatchActive
+                or tostring(state.RankedActiveMatchId) ~= gameId then
+                state.RankedMatchActive = true
+                state.RankedActiveMatchId = gameId
+                state.RankedEndHandledId = nil
             end
+            state.RankedQueuePending = false
+            state.AutoRankedBusy = false
         end
 
         -- Detect the move BEFORE replacing LastSnapshot.
@@ -1648,23 +1839,27 @@ task.spawn(function()
 
                     state.AccuracyMoveSerial = state.AccuracyMoveSerial + 1
 
-                    -- Analyze accuracy on every 2nd ply only. This substantially
-                    -- reduces API usage while leaving every actual bot move at
-                    -- the full depth/time limit.
-                    if state.AccuracyMoveSerial % 2 == 0 then
-                        state.PendingAccuracy = {
-                            generation = state.AccuracyGeneration,
-                            fen = previousSnapshot.fen,
-                            uci = move.uci,
-                            side = move.side,
-                            playedMove = move.from .. "-" .. move.to,
-                        }
-                    end
+                    -- Analyze every detected ply. White and Black are stored
+                    -- separately so neither side is omitted.
+                    state.PendingAccuracy = {
+                        generation = state.AccuracyGeneration,
+                        fen = previousSnapshot.fen,
+                        uci = move.uci,
+                        side = move.side,
+                        playedMove = move.from .. "-" .. move.to,
+                        moveNumber = math.ceil(state.AccuracyMoveSerial / 2),
+                    }
                 end
             end
         end
 
-        if state.AutoRanked and not currentMatch then
+        if state.AutoRanked
+            and not currentMatch
+            and not state.RankedQueuePending
+            and not state.RankedMatchActive
+            and not state.RankedPostGame
+            and not state.RankedTeleporting
+            and not state.AutoRankedBusy then
             queueRanked()
         end
 
