@@ -1370,11 +1370,13 @@ state.Destroy = function()
     end
 
     state.Destroyed = true
-    state.Enabled = false
-    state.AutoRanked = false
-    saveConfig()
 
-    pcall(function() gui:Destroy() end)
+    -- Do NOT change persistent settings here.
+    -- This function is only used to shut down an old script instance.
+
+    pcall(function()
+        gui:Destroy()
+    end)
 end
 
 local onlyStartedOutput = true
