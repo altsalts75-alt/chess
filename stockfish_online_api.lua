@@ -32,7 +32,9 @@ local MovePiece = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("Mo
 local EndGame = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("EndGame")
 local CloseMatch = ReplicatedStorage:WaitForChild("Connections"):WaitForChild("CloseMatch")
 
-local STOCKFISH_URL = "http://127.0.0.1:5001/bestmove"
+local CHESS_API_URL = "https://chess-api.com/v1"
+local CHESS_API_DEPTH = 18
+local CHESS_API_MAX_THINKING_MS = 100
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
@@ -465,44 +467,122 @@ local function boardToFen(board)
     }, " ")
 end
 
+local function apiThinkingMs(seconds)
+    local requested = math.floor((tonumber(seconds) or 0.1) * 1000 + 0.5)
+    return math.clamp(requested, 10, CHESS_API_MAX_THINKING_MS)
+end
+
 local function requestStockfish(payload)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
     end
 
+    local apiPayload = {
+        fen = payload.fen,
+        depth = math.clamp(
+            tonumber(payload.depth) or CHESS_API_DEPTH,
+            1,
+            18
+        ),
+        maxThinkingTime = math.clamp(
+            tonumber(payload.maxThinkingTime)
+                or apiThinkingMs(state.EngineSeconds),
+            10,
+            CHESS_API_MAX_THINKING_MS
+        ),
+        taskId = HttpService:GenerateGUID(false),
+    }
+
+    if type(payload.searchmoves) == "string"
+        and payload.searchmoves ~= "" then
+        apiPayload.searchmoves = payload.searchmoves
+    end
+
     local response = requestFunction({
-        Url = STOCKFISH_URL,
+        Url = CHESS_API_URL,
         Method = "POST",
         Headers = {
             ["Content-Type"] = "application/json",
         },
-        Body = HttpService:JSONEncode(payload),
+        Body = HttpService:JSONEncode(apiPayload),
     })
 
     if not response then
-        error("No response from Stockfish bridge")
+        error("No response from chess-api.com")
     end
 
-    local statusCode = tonumber(response.StatusCode or response.Status or 0) or 0
-    if statusCode ~= 0 and (statusCode < 200 or statusCode >= 300) then
-        error("Stockfish bridge HTTP error: " .. tostring(statusCode) .. " " .. tostring(response.StatusMessage or ""))
+    local statusCode =
+        tonumber(response.StatusCode or response.Status or 0) or 0
+
+    if statusCode ~= 0
+        and (statusCode < 200 or statusCode >= 300) then
+
+        error(
+            "Chess API HTTP error: "
+                .. tostring(statusCode)
+                .. " "
+                .. tostring(response.StatusMessage or "")
+        )
     end
 
     local body = response.Body or response.body
+
     if type(body) ~= "string" then
-        error("Stockfish bridge returned no body")
+        error("Chess API returned no body")
     end
 
-    local ok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+    local ok, decoded =
+        pcall(HttpService.JSONDecode, HttpService, body)
+
     if not ok or type(decoded) ~= "table" then
-        error("Invalid JSON from Stockfish bridge")
+        error("Invalid JSON from chess-api.com")
     end
 
-    if decoded.ok == false then
-        error(tostring(decoded.error or "Stockfish bridge error"))
+    if decoded.error then
+        error(tostring(decoded.error))
     end
 
     return decoded
+end
+
+local function apiResultToCp(result)
+    if type(result) ~= "table" then
+        return nil
+    end
+
+    if result.mate ~= nil then
+        local mate = tonumber(result.mate)
+
+        if mate then
+            if mate > 0 then
+                return 100000
+                    - math.min(
+                        50000,
+                        math.max(0, mate - 1) * 100
+                    )
+            end
+
+            return -100000
+                + math.min(
+                    50000,
+                    math.max(0, -mate - 1) * 100
+                )
+        end
+    end
+
+    local centipawns = tonumber(result.centipawns)
+
+    if centipawns then
+        return centipawns
+    end
+
+    local eval = tonumber(result.eval)
+
+    if eval then
+        return eval * 100
+    end
+
+    return nil
 end
 
 local function mapEngineMove(board, uciMove)
@@ -571,31 +651,57 @@ end
 local function analyzePosition(board)
     local result = requestStockfish({
         fen = boardToFen(board),
-        movetime = math.floor(state.EngineSeconds * 1000 + 0.5),
-        gameKey = boardKey(board),
+        depth = CHESS_API_DEPTH,
+        maxThinkingTime = apiThinkingMs(state.EngineSeconds),
     })
 
-    if not result.bestmove then
+    local uciMove = result.move or result.lan
+
+    if type(uciMove) ~= "string" or uciMove == "" then
         return fallbackAnalysis(board)
     end
 
-    local piece, move, fromNotation, toNotation = mapEngineMove(board, result.bestmove)
+    local piece, move, fromNotation, toNotation =
+        mapEngineMove(board, uciMove)
+
     if not piece or not move then
         return fallbackAnalysis(board)
+    end
+
+    local score
+    local scoreType
+
+    if result.mate ~= nil and tonumber(result.mate) then
+        score = tonumber(result.mate)
+        scoreType = "mate"
+    else
+        score = tonumber(result.eval)
+        scoreType = "eval"
+    end
+
+    local pv
+
+    if type(result.continuationArr) == "table" then
+        pv = table.concat(result.continuationArr, " ")
     end
 
     return {
         piece = piece,
         moveInfo = move,
+
         from = fromNotation,
         to = toNotation,
-        uci = result.bestmove,
-        score = result.score,
-        scoreType = result.scoreType,
+
+        uci = uciMove,
+
+        score = score,
+        scoreType = scoreType,
+
         depth = result.depth,
-        pv = result.pv,
+        pv = pv,
         nps = result.nps,
-        timeMs = result.timeMs,
+
+        timeMs = tonumber(result.time),
     }
 end
 
@@ -606,6 +712,10 @@ local function scoreToCp(scoreType, score)
 
     if scoreType == "cp" then
         return score
+    end
+
+    if scoreType == "eval" then
+    return score * 100
     end
 
     if scoreType == "mate" then
@@ -1431,15 +1541,25 @@ task.spawn(function()
                     local playedMove = move.from .. "-" .. move.to
 
                     task.spawn(function()
-                        local ok, result = pcall(function()
-                            return requestStockfish({
-                                endpoint = "evaluate",
-                                fen = previousFen,
-                                move = move.uci,
-                                movetime = math.floor(state.AccuracySeconds * 1000 + 0.5),
-                                gameKey = gameKey,
-                            })
-                        end)
+                     local ok, result = pcall(function()
+    local bestResult = requestStockfish({
+        fen = previousFen,
+        depth = CHESS_API_DEPTH,
+        maxThinkingTime = apiThinkingMs(state.EngineSeconds),
+    })
+
+    local playedResult = requestStockfish({
+        fen = previousFen,
+        depth = CHESS_API_DEPTH,
+        maxThinkingTime = apiThinkingMs(state.AccuracySeconds),
+        searchmoves = move.uci,
+    })
+
+    return {
+        best = bestResult,
+        played = playedResult,
+    }
+end)
 
                         if state.Destroyed or generation ~= state.AccuracyGeneration then
                             return
@@ -1461,18 +1581,33 @@ task.spawn(function()
                         local accuracy
                         local cpl
 
-                        if result.sameAsBest or result.bestmove == move.uci then
-                            accuracy = 100
-                            cpl = 0
-                        else
-                            local bestCp = scoreToCp(result.bestScoreType, result.bestScore)
-                            local playedCp = scoreToCp(result.playedScoreType, result.playedScore)
+                     local bestResult = result.best
+local playedResult = result.played
 
-                            if bestCp ~= nil and playedCp ~= nil then
-                                cpl = math.max(0, bestCp - playedCp)
-                                accuracy = accuracyFromCpl(cpl)
-                            end
-                        end
+local bestMove =
+    bestResult
+    and (bestResult.move or bestResult.lan)
+
+if bestMove == move.uci then
+    accuracy = 100
+    cpl = 0
+else
+    local bestCp = apiResultToCp(bestResult)
+    local playedCp = apiResultToCp(playedResult)
+
+    if bestCp ~= nil and playedCp ~= nil then
+        -- chess-api.com reports evaluations from White's POV.
+        -- Convert the difference into loss for the player who moved.
+
+        if side == "White" then
+            cpl = math.max(0, bestCp - playedCp)
+        else
+            cpl = math.max(0, playedCp - bestCp)
+        end
+
+        accuracy = accuracyFromCpl(cpl)
+    end
+end
 
                         if accuracy == nil then
                             if moveSerial >= state.LastAccuracyDisplayedSerial then
