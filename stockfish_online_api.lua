@@ -216,6 +216,7 @@ local state = {
     NextRankedAttempt = 0,
     PendingPlayKey = nil,
     PendingAccuracy = nil,
+    LastOwnAnalysis = nil,
 }
 
 if state.AutoRanked then
@@ -433,19 +434,33 @@ end
 
 local apiRequestBusy = false
 local apiNextRequestAt = 0
+local apiEngineWaiting = 0
 
 local function requestStockfish(payload)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
     end
 
-    -- All engine/accuracy calls share one request lane. This prevents
-    -- concurrent requests from overwhelming the public API.
-    while apiRequestBusy do
+    local priority = payload.priority == "accuracy" and "accuracy" or "engine"
+
+    if priority == "engine" then
+        apiEngineWaiting = apiEngineWaiting + 1
+    end
+
+    -- All engine/accuracy calls share one request lane. Engine requests have
+    -- priority so periodic accuracy analysis can never hold up autoplay.
+    while apiRequestBusy or (priority == "accuracy" and apiEngineWaiting > 0) do
         if state.Destroyed then
+            if priority == "engine" then
+                apiEngineWaiting = math.max(0, apiEngineWaiting - 1)
+            end
             error("Script destroyed while waiting for API request")
         end
         task.wait(0.03)
+    end
+
+    if priority == "engine" then
+        apiEngineWaiting = math.max(0, apiEngineWaiting - 1)
     end
 
     apiRequestBusy = true
@@ -661,6 +676,7 @@ local function analyzePosition(board)
         pv = pv,
         nps = result.nps,
         timeMs = tonumber(result.time),
+        apiResult = result,
     }
 end
 
@@ -973,7 +989,7 @@ bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromOffset(318, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 182), UDim2.fromOffset(318, 44), "Last move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
+local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 182), UDim2.fromOffset(318, 44), "Last sampled move: --\nGame accuracy: --", 11, Color3.fromRGB(210, 215, 225))
 
 local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 238), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
@@ -1166,6 +1182,20 @@ local function playRecommendation(recommendation)
         MatchClient:processRound(piece, moveInfo, options)
     end)
 
+    if ok then
+        -- Cache the exact engine result used for this position. If this move
+        -- is selected for periodic accuracy sampling, we already know the
+        -- engine's best move and evaluation and don't need another API call.
+        state.LastOwnAnalysis = {
+            generation = state.AccuracyGeneration,
+            fen = recommendation.positionFen,
+            uci = recommendation.uci,
+            apiResult = recommendation.apiResult,
+            side = recommendation.side,
+            playedMove = recommendation.from .. "-" .. recommendation.to,
+        }
+    end
+
     return ok
 end
 
@@ -1178,47 +1208,63 @@ local function processAccuracyJob(job)
         return
     end
 
-    local bestOk, bestResult = pcall(function()
-        return requestStockfish({
-            fen = job.fen,
-        })
-    end)
+    -- If this was one of our own engine-selected moves, the engine result
+    -- used to choose it is already cached. That means no second "best move"
+    -- request is necessary.
+    local bestResult = job.bestResult
 
-    if not bestOk or not bestResult then
-        accuracyLabel.Text = string.format(
-            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-            job.side,
-            job.playedMove,
-            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-        )
-        return
-    end
+    if not bestResult then
+        local bestOk, fetchedBest = pcall(function()
+            return requestStockfish({
+                fen = job.fen,
+                priority = "accuracy",
+            })
+        end)
 
-    local playedOk, playedResult = pcall(function()
-        return requestStockfish({
-            fen = job.fen,
-            searchmoves = job.uci,
-        })
-    end)
+        if not bestOk or not fetchedBest then
+            accuracyLabel.Text = string.format(
+                "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
+                job.side,
+                job.playedMove,
+                state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
+            )
+            return
+        end
 
-    if not playedOk or not playedResult then
-        accuracyLabel.Text = string.format(
-            "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
-            job.side,
-            job.playedMove,
-            state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
-        )
-        return
+        bestResult = fetchedBest
     end
 
     local bestMove = bestResult.move or bestResult.lan
     local accuracy
     local cpl
 
+    -- If the sampled move is already the engine's best move, it is 100%
+    -- accurate and we do not need a second API request.
     if bestMove == job.uci then
         accuracy = 100
         cpl = 0
     else
+        -- Only the played-move evaluation is needed now. This is the main
+        -- API-usage reduction: the best-position request is reused whenever
+        -- we already analyzed that position.
+        local playedOk, playedResult = pcall(function()
+            return requestStockfish({
+                fen = job.fen,
+                searchmoves = job.uci,
+                priority = "accuracy",
+            })
+        end)
+
+        if not playedOk or not playedResult then
+            accuracyLabel.Text = string.format(
+                "Last move: %s %s • Accuracy unavailable\nGame accuracy: %.0f%%",
+                job.side,
+                job.playedMove,
+                state.AccuracyCount > 0 and (state.AccuracySum / state.AccuracyCount) or 0
+            )
+            return
+        end
+
         local bestCp = apiResultToCp(bestResult)
         local playedCp = apiResultToCp(playedResult)
 
@@ -1228,6 +1274,7 @@ local function processAccuracyJob(job)
             else
                 cpl = math.max(0, playedCp - bestCp)
             end
+
             accuracy = accuracyFromCpl(cpl)
         end
     end
@@ -1253,7 +1300,7 @@ local function processAccuracyJob(job)
     local classification = classifyAccuracy(accuracy)
 
     accuracyLabel.Text = string.format(
-        "Last move: %s %s • %.0f%% %s • %d CPL\nGame accuracy: %.0f%%",
+        "Last sampled move: %s %s • %.0f%% %s • %d CPL\nGame accuracy: %.0f%%",
         job.side,
         job.playedMove,
         accuracy,
@@ -1478,6 +1525,7 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.CurrentGameId = nil
         state.PendingPlayKey = nil
         state.PendingAccuracy = nil
+        state.LastOwnAnalysis = nil
         state.NextRankedAttempt = os.clock() + 1
 
         if state.AutoRanked then
@@ -1538,6 +1586,7 @@ task.spawn(function()
             state.LastBoardKey = key
             state.PendingPlayKey = nil
             state.PendingAccuracy = nil
+            state.LastOwnAnalysis = nil
 
             if not gameId then
                 accuracyLabel.Text = "Last move: --\nGame accuracy: --"
@@ -1545,8 +1594,8 @@ task.spawn(function()
         end
 
         -- Detect the move BEFORE replacing LastSnapshot.
-        -- Accuracy jobs are stored and processed serially so they can never
-        -- compete with the next move-analysis request.
+        -- Accuracy is sampled on every second game move to reduce API usage.
+        -- Only the sampled moves create an accuracy job.
         if currentMatch and snapshot and state.LastSnapshot and gameId == state.CurrentGameId then
             local previousSnapshot = state.LastSnapshot
 
@@ -1555,13 +1604,40 @@ task.spawn(function()
 
                 if move then
                     state.AccuracyMoveSerial = state.AccuracyMoveSerial + 1
-                    state.PendingAccuracy = {
-                        generation = state.AccuracyGeneration,
-                        fen = previousSnapshot.fen,
-                        uci = move.uci,
-                        side = move.side,
-                        playedMove = move.from .. "-" .. move.to,
-                    }
+
+                    if state.AccuracyMoveSerial % 2 == 0 then
+                        local bestResult = nil
+
+                        -- If the sampled move was made by us and matches the
+                        -- exact position/move we just analyzed, reuse that API
+                        -- result instead of requesting the best move again.
+                        local previousBoard = previousSnapshot.board
+                        local localMover =
+                            previousBoard
+                            and previousBoard.players
+                            and previousBoard.players[previousSnapshot.activeTeam]
+                            == LocalPlayer
+
+                        local cached = state.LastOwnAnalysis
+
+                        if localMover
+                            and cached
+                            and cached.generation == state.AccuracyGeneration
+                            and cached.fen == previousSnapshot.fen
+                            and cached.uci == move.uci then
+
+                            bestResult = cached.apiResult
+                        end
+
+                        state.PendingAccuracy = {
+                            generation = state.AccuracyGeneration,
+                            fen = previousSnapshot.fen,
+                            uci = move.uci,
+                            side = move.side,
+                            playedMove = move.from .. "-" .. move.to,
+                            bestResult = bestResult,
+                        }
+                    end
                 end
             end
         end
