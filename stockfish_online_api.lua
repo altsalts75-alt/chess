@@ -254,6 +254,9 @@ end
 
 local state = {
     Enabled = config.AutoPlay,
+    -- Persistent user preference. `AutoRanked` below is the effective runtime
+    -- state and may be temporarily suspended while the primary API cools down.
+    AutoRankedUserSetting = config.AutoRanked,
     AutoRanked = config.AutoRanked,
     MenuKeyCode = Enum.KeyCode[config.MenuKeyCode] or Enum.KeyCode.RightShift,
     Busy = false,
@@ -307,11 +310,20 @@ local state = {
 if state.AutoRanked then
     state.Enabled = true
 end
+
+-- If a previous server already triggered the primary API cooldown, start this
+-- server with Auto Ranked temporarily suspended. The user's preference remains
+-- stored separately and will be restored when the cooldown expires.
+if apiNow() < (tonumber(sharedApi.PrimaryCooldownUntil) or 0) then
+    state.AutoRanked = false
+end
+
 config.AutoPlay = state.Enabled
+config.AutoRanked = state.AutoRankedUserSetting
 
 executorEnv.__CHESS_CONFIG = {
     AutoPlay = config.AutoPlay,
-    AutoRanked = config.AutoRanked,
+    AutoRanked = state.AutoRankedUserSetting,
     MenuKeyCode = config.MenuKeyCode,
 }
 
@@ -326,7 +338,7 @@ Players.LocalPlayer.OnTeleport:Connect(function()
 
     -- Capture the live UI state immediately before the teleport.
     config.AutoPlay = state.Enabled
-    config.AutoRanked = state.AutoRanked
+    config.AutoRanked = state.AutoRankedUserSetting
     config.MenuKeyCode = state.MenuKeyCode.Name
 
     saveConfig()
@@ -648,6 +660,53 @@ local function markHighUsage()
     state.ApiHighUsageUntil = sharedApi.PrimaryCooldownUntil
 end
 
+local function formatCooldown(seconds)
+    seconds = math.max(0, math.ceil(tonumber(seconds) or 0))
+    local minutes = math.floor(seconds / 60)
+    local secs = seconds % 60
+    return string.format("%d:%02d", minutes, secs)
+end
+
+local function primaryApiOnCooldown()
+    return apiNow() < (tonumber(sharedApi.PrimaryCooldownUntil) or 0)
+end
+
+-- Temporarily suspend only the EFFECTIVE Auto Ranked state. The persistent
+-- user preference is kept in AutoRankedUserSetting and is never overwritten
+-- by this function.
+local function applyApiCooldownState()
+    local cooldownUntil = tonumber(sharedApi.PrimaryCooldownUntil) or 0
+    state.ApiHighUsageUntil = cooldownUntil
+
+    if cooldownUntil > apiNow() then
+        if state.AutoRankedUserSetting then
+            if state.AutoRanked then
+                state.AutoRanked = false
+                state.RankedQueuePending = false
+                state.RankedPostGame = false
+                state.RankedTeleporting = false
+                state.AutoRankedBusy = false
+            end
+        else
+            state.AutoRanked = false
+        end
+        return true, cooldownUntil - apiNow()
+    end
+
+    -- Cooldown expired. Restore exactly the user's saved preference.
+    if state.AutoRanked ~= state.AutoRankedUserSetting then
+        state.AutoRanked = state.AutoRankedUserSetting
+        state.NextRankedAttempt = os.clock() + 1
+        state.RankedStartupReadyAt = os.clock() + 1
+        state.RankedQueuePending = false
+        state.RankedPostGame = false
+        state.RankedTeleporting = false
+        state.AutoRankedBusy = false
+    end
+
+    return false, 0
+end
+
 local function requestStockfishOnline(payload, laneAlreadyHeld)
     if type(requestFunction) ~= "function" then
         error("No executor HTTP request function is available")
@@ -789,6 +848,7 @@ local function requestStockfish(payload)
 
     local requestKind = payload.kind == "accuracy" and "accuracy" or "engine"
     local now = apiNow()
+    applyApiCooldownState()
 
     -- If chess-api.com has recently returned HIGH_USAGE, do not probe it again
     -- for several minutes. Use the independent provider instead. This is a
@@ -1273,7 +1333,7 @@ gui.Parent = PlayerGui
 
 local main = Instance.new("Frame")
 main.Name = "Main"
-main.Size = UDim2.fromOffset(382, 395)
+main.Size = UDim2.fromOffset(382, 225)
 main.Position = UDim2.new(config.XScale, config.XOffset, config.YScale, config.YOffset)
 main.BackgroundColor3 = Color3.fromRGB(16, 17, 22)
 main.BorderSizePixel = 0
@@ -1385,11 +1445,20 @@ local autoPlayToggle = makeToggle(62, "Auto Play", state.Enabled, function(enabl
 end)
 
 autoRankedToggle = makeToggle(100, "Auto Ranked Loop", state.AutoRanked, function(enabled)
-    state.AutoRanked = enabled
+    -- This is the user's actual ON/OFF preference. It is saved even when the
+    -- effective runtime state has been temporarily suspended by API cooldown.
+    state.AutoRankedUserSetting = enabled
     config.AutoRanked = enabled
     config.AutoPlay = state.Enabled
 
-    if enabled then
+    local cooldown = primaryApiOnCooldown()
+    if cooldown then
+        state.AutoRanked = false
+    else
+        state.AutoRanked = enabled
+    end
+
+    if state.AutoRanked then
         state.Enabled = true
         autoPlayToggle.value = true
         autoPlayToggle.button.Text = "ON"
@@ -1404,13 +1473,17 @@ autoRankedToggle = makeToggle(100, "Auto Ranked Loop", state.AutoRanked, functio
         state.RankedMatchActive = MatchClient.currentMatch ~= nil
         state.RankedActiveMatchId = MatchClient.currentMatch and tostring(MatchClient.currentMatch.id) or nil
     else
-        -- Turning Auto Ranked off only changes its selected state and clears
-        -- runtime guards. The saved value remains exactly what the user chose.
         state.RankedQueuePending = false
         state.RankedPostGame = false
         state.RankedTeleporting = false
         state.AutoRankedBusy = false
     end
+
+    autoRankedToggle.value = state.AutoRanked
+    autoRankedToggle.button.Text = state.AutoRanked and "ON" or "OFF"
+    autoRankedToggle.button.BackgroundColor3 = state.AutoRanked
+        and Color3.fromRGB(42, 160, 105)
+        or Color3.fromRGB(48, 50, 59)
 
     saveConfig()
 end)
@@ -1420,54 +1493,10 @@ bestMoveLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 local searchStatusLabel = makeLabel(main, UDim2.fromOffset(16, 160), UDim2.fromOffset(350, 18), "Ready", 10, Color3.fromRGB(130, 138, 155))
 
-local function makeAccuracyBox(position, titleText)
-    makeLabel(main, position, UDim2.fromOffset(130, 16), titleText, 9, Color3.fromRGB(130, 138, 155))
-
-    local box = Instance.new("ScrollingFrame")
-    box.Size = UDim2.fromOffset(350, 58)
-    box.Position = UDim2.fromOffset(16, position.Y.Offset + 16)
-    box.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
-    box.BorderSizePixel = 0
-    box.CanvasSize = UDim2.fromOffset(0, 0)
-    box.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    box.ScrollingDirection = Enum.ScrollingDirection.Y
-    box.ScrollBarThickness = 4
-    box.ScrollBarImageTransparency = 0.35
-    box.ClipsDescendants = true
-    box.Parent = main
-
-    local padding = Instance.new("UIPadding")
-    padding.PaddingLeft = UDim.new(0, 7)
-    padding.PaddingRight = UDim.new(0, 7)
-    padding.PaddingTop = UDim.new(0, 5)
-    padding.PaddingBottom = UDim.new(0, 5)
-    padding.Parent = box
-
-    local layout = Instance.new("UIListLayout")
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 1)
-    layout.Parent = box
-
-    local boxCorner = Instance.new("UICorner")
-    boxCorner.CornerRadius = UDim.new(0, 7)
-    boxCorner.Parent = box
-
-    local boxStroke = Instance.new("UIStroke")
-    boxStroke.Color = Color3.fromRGB(45, 47, 55)
-    boxStroke.Thickness = 1
-    boxStroke.Parent = box
-
-    return box
-end
-
-local whiteAccuracyBox = makeAccuracyBox(UDim2.fromOffset(16, 181), "WHITE MOVES")
-local blackAccuracyBox = makeAccuracyBox(UDim2.fromOffset(16, 257), "BLACK MOVES")
-local accuracyLabel = makeLabel(main, UDim2.fromOffset(16, 333), UDim2.fromOffset(350, 22), "Game accuracy: --", 11, Color3.fromRGB(210, 215, 225))
-
-local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 362), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
+local menuKeyLabel = makeLabel(main, UDim2.fromOffset(16, 190), UDim2.fromOffset(120, 18), "Menu key", 10, Color3.fromRGB(130, 138, 155))
 local menuKeyButton = Instance.new("TextButton")
 menuKeyButton.Size = UDim2.fromOffset(120, 22)
-menuKeyButton.Position = UDim2.fromOffset(246, 359)
+menuKeyButton.Position = UDim2.fromOffset(246, 187)
 menuKeyButton.BackgroundColor3 = Color3.fromRGB(25, 27, 34)
 menuKeyButton.BorderSizePixel = 0
 menuKeyButton.AutoButtonColor = false
@@ -1578,6 +1607,10 @@ local function updateAnalysisUI(recommendation)
     )
 
     local displayThinking = recommendation.thinkingMs or CHESS_API_MAX_THINKING_MS
+    if primaryApiOnCooldown() then
+        return
+    end
+
     searchStatusLabel.Text = string.format(
         "Depth %s  •  %sms max  •  %s",
         tostring(recommendation.depth or "?"),
@@ -1587,13 +1620,49 @@ local function updateAnalysisUI(recommendation)
     )
 end
 
+local function updateCooldownUI()
+    while not state.Destroyed do
+        local active, remaining = applyApiCooldownState()
+
+        if active then
+            searchStatusLabel.Text = "API cooldown: " .. formatCooldown(remaining)
+
+            -- Reflect the temporarily suspended effective state in the UI,
+            -- while the persistent preference remains separate underneath.
+            if autoRankedToggle then
+                autoRankedToggle.value = false
+                autoRankedToggle.button.Text = "OFF"
+                autoRankedToggle.button.BackgroundColor3 = Color3.fromRGB(48, 50, 59)
+            end
+        else
+            if autoRankedToggle then
+                autoRankedToggle.value = state.AutoRanked
+                autoRankedToggle.button.Text = state.AutoRanked and "ON" or "OFF"
+                autoRankedToggle.button.BackgroundColor3 = state.AutoRanked
+                    and Color3.fromRGB(42, 160, 105)
+                    or Color3.fromRGB(48, 50, 59)
+            end
+
+            if string.find(searchStatusLabel.Text or "", "API cooldown:", 1, true) then
+                searchStatusLabel.Text = "Ready"
+            end
+        end
+
+        task.wait(active and 0.2 or 0.5)
+    end
+end
+
+task.spawn(updateCooldownUI)
+
 local function analyzeCurrent(board)
     if state.Busy or not board or not isPlayerTurn(board) then
         return nil
     end
 
     state.Busy = true
-    searchStatusLabel.Text = "Analyzing..."
+    if not primaryApiOnCooldown() then
+        searchStatusLabel.Text = "Analyzing..."
+    end
 
     local generationKey = boardKey(board)
     local positionFen = boardToFen(board, state.LastMoveUci)
@@ -1611,7 +1680,11 @@ local function analyzeCurrent(board)
         if #reason > 52 then
             reason = string.sub(reason, 1, 52) .. "..."
         end
-        searchStatusLabel.Text = "Engine unavailable: " .. reason
+        if primaryApiOnCooldown() then
+            searchStatusLabel.Text = "API cooldown: " .. formatCooldown((tonumber(sharedApi.PrimaryCooldownUntil) or 0) - apiNow())
+        else
+            searchStatusLabel.Text = "Engine unavailable: " .. reason
+        end
         return nil
     end
     -- Keep the completed analysis visible even if the opponent moved while
@@ -1675,39 +1748,6 @@ local function playRecommendation(recommendation)
     return ok
 end
 
-local function refreshAccuracyBox(box, lines)
-    for _, child in ipairs(box:GetChildren()) do
-        if child:IsA("TextLabel") then
-            child:Destroy()
-        end
-    end
-
-    for index, line in ipairs(lines) do
-        local label = Instance.new("TextLabel")
-        label.BackgroundTransparency = 1
-        label.Size = UDim2.new(1, -2, 0, 15)
-        label.Font = Enum.Font.GothamMedium
-        label.TextSize = 9
-        label.TextColor3 = Color3.fromRGB(210, 215, 225)
-        label.TextXAlignment = Enum.TextXAlignment.Left
-        label.TextYAlignment = Enum.TextYAlignment.Center
-        label.TextWrapped = false
-        label.Text = line
-        label.LayoutOrder = index
-        label.Parent = box
-    end
-
-    task.defer(function()
-        local bottom = math.max(0, box.AbsoluteCanvasSize.Y - box.AbsoluteWindowSize.Y)
-        box.CanvasPosition = Vector2.new(0, bottom)
-    end)
-end
-
-local function setAccuracyBoxes()
-    refreshAccuracyBox(whiteAccuracyBox, state.WhiteAccuracyMoves)
-    refreshAccuracyBox(blackAccuracyBox, state.BlackAccuracyMoves)
-end
-
 local function appendAccuracyMove(job, accuracy, classification, cpl)
     local moveNumber = tonumber(job.moveNumber) or 1
     local line = string.format(
@@ -1724,7 +1764,6 @@ local function appendAccuracyMove(job, accuracy, classification, cpl)
     while #target > 40 do
         table.remove(target, 1)
     end
-    setAccuracyBoxes()
 end
 
 local function processAccuracyJob(job, suppliedPostResult)
@@ -1812,12 +1851,6 @@ local function processAccuracyJob(job, suppliedPostResult)
     local gameAccuracy = state.AccuracySum / state.AccuracyCount
     local classification = classifyAccuracy(accuracy)
     appendAccuracyMove(job, accuracy, classification, cpl)
-
-    accuracyLabel.Text = string.format(
-        "Game accuracy: %.1f%%  •  %d analyzed",
-        gameAccuracy,
-        state.AccuracyCount
-    )
 
     return true
 end
@@ -2165,10 +2198,12 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.AccuracyCount = 0
         state.WhiteAccuracyMoves = {}
         state.BlackAccuracyMoves = {}
-        setAccuracyBoxes()
-        accuracyLabel.Text = "Game accuracy: --"
-        state.NextRankedAttempt = os.clock() + 1
+            state.NextRankedAttempt = os.clock() + 1
 
+        -- Never start another ranked queue/server hop while the primary API is
+        -- cooling down. Auto Ranked may be temporarily OFF at runtime, but the
+        -- user's saved preference remains state.AutoRankedUserSetting.
+        applyApiCooldownState()
         if not state.AutoRanked then
             state.RankedPostGame = false
             state.AutoRankedBusy = false
@@ -2195,6 +2230,7 @@ EndGame.OnClientEvent:Connect(function(matchId)
 end)
 
 TeleportService.TeleportInitFailed:Connect(function()
+    applyApiCooldownState()
     if state.AutoRanked and not state.Destroyed then
         state.RankedTeleporting = false
         state.RankedPostGame = false
@@ -2226,6 +2262,8 @@ end
 
 task.spawn(function()
     while not state.Destroyed do
+        applyApiCooldownState()
+
         local currentMatch = MatchClient.currentMatch
         local gameId = currentMatch and tostring(currentMatch.id) or nil
         local key = currentMatch and boardKey(currentMatch) or nil
@@ -2254,9 +2292,7 @@ task.spawn(function()
             state.AccuracyBaselineResult = nil
             state.WhiteAccuracyMoves = {}
             state.BlackAccuracyMoves = {}
-            setAccuracyBoxes()
-            accuracyLabel.Text = "Game accuracy: --"
-        end
+                    end
 
         -- A real MatchClient.currentMatch means matchmaking succeeded. While it
         -- exists, the ranked queue is considered active and cannot fire again.
