@@ -16,7 +16,7 @@ local STOCKFISH_URL = "http://127.0.0.1:5001/bestmove"
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
-local GITHUB_RAW_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPOSITORY/main/prometheus_stockfish.lua"
+local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/refs/heads/main/prometheus_stockfish_final_github_keepiy.lua"
 
 local executorEnv = getgenv and getgenv() or _G
 local executorSyn = type(executorEnv.syn) == "table" and executorEnv.syn or nil
