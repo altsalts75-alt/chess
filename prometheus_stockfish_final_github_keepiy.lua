@@ -2,7 +2,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -17,9 +16,6 @@ local STOCKFISH_URL = "http://127.0.0.1:5001/bestmove"
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
-local SERVER_LIST_LIMIT = 50
-local SERVER_SCAN_PAGES = 5
-local SERVER_HOP_DELAY = 0.8
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/prometheus_stockfish_final_github_keepiy.lua"
 
 local executorEnv = getgenv and getgenv() or _G
@@ -201,6 +197,8 @@ local state = {
     AutoRankedBusy = false,
     NextRankedAttempt = 0,
     PendingPlayKey = nil,
+    NeedsFreshQueue = true,
+    QueueStartedAt = 0,
 }
 
 if state.AutoRanked then
@@ -1084,120 +1082,29 @@ local function playRecommendation(recommendation)
     return ok
 end
 
-local function findRankedButton()
-    local menuGui = PlayerGui:FindFirstChild("menu")
-    if not menuGui then
-        return nil
-    end
+local function getMatchfinding()
+    local ok, module = pcall(function()
+        return require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
+    end)
 
-    local frame = menuGui:FindFirstChild("Frame")
-    local ranked = frame and frame:FindFirstChild("Ranked")
-    local rankedFrame = ranked and ranked:FindFirstChild("Frame")
-    local button = rankedFrame and rankedFrame:FindFirstChild("button")
-
-    if button and button:IsA("GuiButton") then
-        return button
+    if ok and type(module) == "table" then
+        return module
     end
 
     return nil
 end
 
-local function getServerList(cursor)
-    local url = string.format(
-        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=%d%s",
-        tostring(game.PlaceId),
-        SERVER_LIST_LIMIT,
-        cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
-    )
+local function waitForQueueState(matchfinding, desired, timeout)
+    local deadline = os.clock() + timeout
 
-    local ok, raw = pcall(function()
-        if type(requestFunction) == "function" then
-            local response = requestFunction({
-                Url = url,
-                Method = "GET",
-            })
-            if not response then
-                error("No response from Roblox server list")
-            end
-            local body = response.Body or response.body
-            if type(body) ~= "string" then
-                error("Invalid server-list response")
-            end
-            return body
+    while os.clock() < deadline do
+        if matchfinding.inque == desired then
+            return true
         end
-        return game:HttpGet(url)
-    end)
-
-    if not ok then
-        return nil
+        task.wait(0.05)
     end
 
-    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
-    if not decodedOk or type(data) ~= "table" then
-        return nil
-    end
-
-    return data
-end
-
-local function findMostPopulatedServer()
-    local currentJobId = tostring(game.JobId)
-    local best = nil
-    local cursor = nil
-
-    for _ = 1, SERVER_SCAN_PAGES do
-        local page = getServerList(cursor)
-        if not page then
-            break
-        end
-
-        for _, server in ipairs(page.data or {}) do
-            local id = tostring(server.id or "")
-            local playing = tonumber(server.playing) or 0
-            local maxPlayers = tonumber(server.maxPlayers) or 0
-
-            if id ~= ""
-                and id ~= currentJobId
-                and maxPlayers > 0
-                and playing < maxPlayers then
-                if not best or playing > best.playing then
-                    best = {
-                        id = id,
-                        playing = playing,
-                        maxPlayers = maxPlayers,
-                    }
-                end
-            end
-        end
-
-        cursor = page.nextPageCursor
-        if not cursor or cursor == "null" then
-            break
-        end
-
-        task.wait(0.15)
-    end
-
-    return best
-end
-
-local function hopToMostPopulatedServer()
-    local target = findMostPopulatedServer()
-    if not target then
-        return false
-    end
-
-    task.wait(SERVER_HOP_DELAY)
-
-    local ok = pcall(function()
-        TeleportService:TeleportToPlaceInstance(
-            game.PlaceId,
-            target.id,
-            LocalPlayer
-        )
-    end)
-
-    return ok
+    return matchfinding.inque == desired
 end
 
 local function queueRanked()
@@ -1210,49 +1117,59 @@ local function queueRanked()
         return false
     end
 
-    local button = findRankedButton()
-    if not button or not button.Visible then
-        return false
-    end
-
-    local matchfinding = nil
-    pcall(function()
-        matchfinding = require((PlayerGui:WaitForChild("matchfinding"):WaitForChild("matchfinding")) :: any)
-    end)
-
-    if matchfinding and matchfinding.inque then
-        return false
-    end
-
     if os.clock() < state.NextRankedAttempt then
         return false
     end
 
-    state.AutoRankedBusy = true
-    state.NextRankedAttempt = os.clock() + 5
-
-    local fired = false
-
-    if type(firesignal) == "function" then
-        local ok = pcall(firesignal, button.Activated)
-        fired = ok
-    elseif type(getconnections) == "function" then
-        local ok, connections = pcall(getconnections, button.Activated)
-        if ok and type(connections) == "table" then
-            for _, connection in ipairs(connections) do
-                if type(connection.Fire) == "function" then
-                    pcall(connection.Fire, connection)
-                    fired = true
-                end
-            end
-        end
+    local matchfinding = getMatchfinding()
+    if not matchfinding then
+        return false
     end
 
-    task.delay(0.35, function()
+    -- After a finished match the game's queue state can remain marked as
+    -- active even though the old match is gone. Reset that state once before
+    -- starting the next queue cycle. This is the state that a server hop was
+    -- previously resetting for us.
+    if matchfinding.inque and state.NeedsFreshQueue then
+        state.AutoRankedBusy = true
+        state.NextRankedAttempt = os.clock() + 1.5
+
+        pcall(function()
+            matchfinding:leave()
+        end)
+
+        waitForQueueState(matchfinding, false, 3)
+        task.wait(0.25)
+
         state.AutoRankedBusy = false
+
+        if matchfinding.inque then
+            return false
+        end
+    elseif matchfinding.inque then
+        -- A fresh queue is already active. Do not cancel it on every loop.
+        return true
+    end
+
+    state.AutoRankedBusy = true
+    state.NextRankedAttempt = os.clock() + 2
+
+    local ok = pcall(function()
+        matchfinding:toggleque()
     end)
 
-    return fired
+    if ok then
+        state.QueueStartedAt = os.clock()
+        state.NeedsFreshQueue = false
+    end
+
+    task.delay(0.5, function()
+        if not state.Destroyed then
+            state.AutoRankedBusy = false
+        end
+    end)
+
+    return ok
 end
 
 EndGame.OnClientEvent:Connect(function(matchId)
@@ -1265,6 +1182,7 @@ EndGame.OnClientEvent:Connect(function(matchId)
     end
 
     state.AutoRankedBusy = true
+    state.NeedsFreshQueue = true
 
     task.spawn(function()
         task.wait(0.35)
@@ -1301,25 +1219,9 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.PendingPlayKey = nil
         state.NextRankedAttempt = os.clock() + 1
 
-        -- A fresh server resets matchmaking state (including a possibly stale
-        -- matchfinding.inque flag), which avoids getting stuck in the ranked queue.
-        if state.AutoRanked then
-            task.spawn(function()
-                hopToMostPopulatedServer()
-            end)
-            return
-        end
-
-        task.wait(1)
+        task.wait(0.5)
         state.AutoRankedBusy = false
     end)
-end)
-
-TeleportService.TeleportInitFailed:Connect(function()
-    if state.AutoRanked and not state.Destroyed then
-        state.AutoRankedBusy = false
-        state.NextRankedAttempt = os.clock() + 2
-    end
 end)
 
 state.Destroy = function()
