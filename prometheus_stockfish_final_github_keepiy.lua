@@ -2,6 +2,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -16,7 +17,10 @@ local STOCKFISH_URL = "http://127.0.0.1:5001/bestmove"
 local DEFAULT_ENGINE_SECONDS = 5
 local DEFAULT_ACCURACY_SECONDS = 1
 local CONFIG_FILE = "prometheus_stockfish_config.json"
-local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/refs/heads/main/prometheus_stockfish_final_github_keepiy.lua"
+local SERVER_LIST_LIMIT = 50
+local SERVER_SCAN_PAGES = 5
+local SERVER_HOP_DELAY = 0.8
+local GITHUB_RAW_URL = "https://raw.githubusercontent.com/altsalts75-alt/chess/main/prometheus_stockfish_final_github_keepiy.lua"
 
 local executorEnv = getgenv and getgenv() or _G
 local executorSyn = type(executorEnv.syn) == "table" and executorEnv.syn or nil
@@ -1098,6 +1102,104 @@ local function findRankedButton()
     return nil
 end
 
+local function getServerList(cursor)
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=%d%s",
+        tostring(game.PlaceId),
+        SERVER_LIST_LIMIT,
+        cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+    )
+
+    local ok, raw = pcall(function()
+        if type(requestFunction) == "function" then
+            local response = requestFunction({
+                Url = url,
+                Method = "GET",
+            })
+            if not response then
+                error("No response from Roblox server list")
+            end
+            local body = response.Body or response.body
+            if type(body) ~= "string" then
+                error("Invalid server-list response")
+            end
+            return body
+        end
+        return game:HttpGet(url)
+    end)
+
+    if not ok then
+        return nil
+    end
+
+    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not decodedOk or type(data) ~= "table" then
+        return nil
+    end
+
+    return data
+end
+
+local function findMostPopulatedServer()
+    local currentJobId = tostring(game.JobId)
+    local best = nil
+    local cursor = nil
+
+    for _ = 1, SERVER_SCAN_PAGES do
+        local page = getServerList(cursor)
+        if not page then
+            break
+        end
+
+        for _, server in ipairs(page.data or {}) do
+            local id = tostring(server.id or "")
+            local playing = tonumber(server.playing) or 0
+            local maxPlayers = tonumber(server.maxPlayers) or 0
+
+            if id ~= ""
+                and id ~= currentJobId
+                and maxPlayers > 0
+                and playing < maxPlayers then
+                if not best or playing > best.playing then
+                    best = {
+                        id = id,
+                        playing = playing,
+                        maxPlayers = maxPlayers,
+                    }
+                end
+            end
+        end
+
+        cursor = page.nextPageCursor
+        if not cursor or cursor == "null" then
+            break
+        end
+
+        task.wait(0.15)
+    end
+
+    return best
+end
+
+local function hopToMostPopulatedServer()
+    local target = findMostPopulatedServer()
+    if not target then
+        return false
+    end
+
+    task.wait(SERVER_HOP_DELAY)
+
+    local ok = pcall(function()
+        TeleportService:TeleportToPlaceInstance(
+            game.PlaceId,
+            target.id,
+            LocalPlayer
+        )
+    end)
+
+    return ok
+end
+
 local function queueRanked()
     if not state.AutoRanked or MatchClient.currentMatch ~= nil or state.AutoRankedBusy then
         return false
@@ -1199,9 +1301,25 @@ EndGame.OnClientEvent:Connect(function(matchId)
         state.PendingPlayKey = nil
         state.NextRankedAttempt = os.clock() + 1
 
+        -- A fresh server resets matchmaking state (including a possibly stale
+        -- matchfinding.inque flag), which avoids getting stuck in the ranked queue.
+        if state.AutoRanked then
+            task.spawn(function()
+                hopToMostPopulatedServer()
+            end)
+            return
+        end
+
         task.wait(1)
         state.AutoRankedBusy = false
     end)
+end)
+
+TeleportService.TeleportInitFailed:Connect(function()
+    if state.AutoRanked and not state.Destroyed then
+        state.AutoRankedBusy = false
+        state.NextRankedAttempt = os.clock() + 2
+    end
 end)
 
 state.Destroy = function()
